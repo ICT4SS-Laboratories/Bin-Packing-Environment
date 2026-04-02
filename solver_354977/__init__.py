@@ -1,7 +1,7 @@
 from .abstract_solver import AbstractSolver
-from .solver_000000 import solver_000000
+from .solver_354977 import solver_354977
 
 __all__ = [
     'AbstractSolver',
-    'solver_000000'
+    'solver_354977'
 ]
