@@ -5,7 +5,13 @@ __pycache__/
 *.pyc
 
 # Ignore everything inside any results/ directory
-results/*
+# results/*
 
 # But keep this specific file
 !results/.gitkeep
+
+# Ignore all .DS_Store files
+.DS_Store
+
+# Copilot instructions
+.github/

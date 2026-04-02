@@ -6,7 +6,7 @@ from instances.instance import Instance
 class AbstractSolver(ABC):
 
     def __init__(self, inst: Instance):
-        self.name = 'solver_354977'
+        self.name = 'solver_356856'
         self.inst = inst
         self.sol = {
             'type_vehicle': [],

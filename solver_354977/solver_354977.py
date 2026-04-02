@@ -32,25 +32,20 @@ import random
 import multiprocessing as mp
 import numpy as np
 import pandas as pd
+from .abstract_solver import AbstractSolver
+
+# Fix for macOS segfault with OR-Tools and multiprocessing
+# Must set spawn method before any other multiprocessing code
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # Already set
 
 try:
     from ortools.linear_solver import pywraplp
     _HAS_ORTOOLS = True
 except ImportError:
     _HAS_ORTOOLS = False
-
-# ---------------------------------------------------------------------------
-# AbstractSolver shim (replaced by the real one in the project)
-# ---------------------------------------------------------------------------
-try:
-    from abstract_solver import AbstractSolver
-except ImportError:
-    class AbstractSolver:
-        def __init__(self, inst):
-            self.inst = inst
-            self.sol = pd.DataFrame()
-        def write_solution_to_file(self):
-            pass
 
 # ===========================================================================
 # § 1  ROTATION UTILITIES
