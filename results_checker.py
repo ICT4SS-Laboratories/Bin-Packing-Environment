@@ -3,8 +3,8 @@ import pandas as pd
 from instances import Instance
 
 if __name__ == '__main__':
-    dataset_name = 'DatasetB'
-    solver_name = 'solver_356856'
+    dataset_name = 'DatasetC'
+    solver_name = 'solver_364130'
     inst = Instance(dataset_name)
 
     # -------------------------

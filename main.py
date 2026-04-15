@@ -10,13 +10,14 @@ if __name__ == '__main__':
     from instances import Instance
     from solver_354977 import solver_354977
     from solver_356856 import solver_356856
+    from solver_364130 import solver_364130
 
-    dataset_name = 'DatasetB'
+    dataset_name = 'DatasetC'
 
     inst = Instance(dataset_name)
 
     # solver = solver_354977(inst)
-    solver = solver_356856(inst)
+    solver = solver_364130(inst)
 
     print(f"Starting solver on {dataset_name}...")
     print(f"Items: {len(inst.df_items)}, Vehicle types: {len(inst.df_vehicles)}")
