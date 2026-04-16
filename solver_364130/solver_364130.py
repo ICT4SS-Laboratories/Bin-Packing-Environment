@@ -536,8 +536,43 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
 #  GRASP construction
 # ══════════════════════════════════════════════════════════════════════════════
 
-def grasp(items, vehicles, alpha, rng, t_end, best_fit=False):
-    scored=sorted(items,key=lambda x:-x['vol'])
+def build_sequence(items, mode, rng):
+    if mode == 'vol':
+        return sorted(items, key=lambda x: (-x['vol'], -x['maxdim']))
+    if mode == 'weight':
+        return sorted(items, key=lambda x: (-x['weight'], -x['vol']))
+    if mode == 'value':
+        return sorted(items, key=lambda x: (-x['value'], -x['vol']))
+    if mode == 'maxdim':
+        return sorted(items, key=lambda x: (-x['maxdim'], -x['vol']))
+    if mode == 'footprint':
+        return sorted(items, key=lambda x: (-x['base_area'], -x['vol']))
+    if mode == 'densw':
+        return sorted(items, key=lambda x: (-x['density_w'], -x['vol']))
+    if mode == 'densv':
+        return sorted(items, key=lambda x: (-x['density_v'], -x['vol']))
+    if mode == 'mixed':
+        a = 0.6 + rng.random()
+        b = 0.4 + rng.random()
+        c = 0.2 + rng.random()
+        d = 0.2 + rng.random()
+        e = 0.2 + rng.random()
+        return sorted(
+            items,
+            key=lambda x: -(
+                a * x['vol'] +
+                b * x['base_area'] +
+                c * x['weight'] +
+                d * x['value'] +
+                e * x['maxdim']
+            ),
+        )
+    seq = list(items)
+    rng.shuffle(seq)
+    return seq
+
+def grasp(items, vehicles, alpha, rng, t_end, best_fit=False, honor_order=False):
+    scored = list(items) if honor_order else sorted(items, key=lambda x: -x['vol'])
     if alpha>1e-9:
         n=len(scored); nd=max(1,int(n*(1-alpha)))
         tail=scored[nd:]; rng.shuffle(tail); scored=scored[:nd]+tail
@@ -641,14 +676,17 @@ def _expr_sum_vars(xvars, cols):
         expr = expr + xvars[int(j)]
     return expr
 
-def _solve_cover_highspy(scaled_costs, cover_rows, clique_rows, t_budget, gap, warm_cols=None):
+def _solve_cover_highspy(
+    scaled_costs, cover_rows, clique_rows, t_budget, gap,
+    warm_cols=None, parallel_mode='on'
+):
     if not _HAS_HIGHSPY:
         return None
     try:
         h = highspy.Highs()
         h.setOptionValue('output_flag', False)
         h.setOptionValue('presolve', 'on')
-        h.setOptionValue('parallel', 'on')
+        h.setOptionValue('parallel', parallel_mode)
         h.setOptionValue('time_limit', float(max(1.0, t_budget)))
         h.setOptionValue('mip_rel_gap', float(gap))
 
@@ -730,7 +768,23 @@ def _rebuild_bin_subset(template_bin, records, ilookup):
         nb.place(iid, x, y, z, iw, id_, ih, orient, it['weight'], it['value'])
     return nb
 
-def _cover_postprocess(selected_bins, all_item_ids, ilookup):
+def _pack_assigned_items(template_bin, assigned_ids, ilookup):
+    rec_map = {rec[0]: rec for rec in template_bin.items}
+    ordered = sorted(
+        assigned_ids,
+        key=lambda iid: (rec_map.get(iid, (None, 0, 0, 0))[3], -ilookup[iid]['vol']),
+    )
+    nb = Bin3D(
+        template_bin.vtype, template_bin.W, template_bin.D, template_bin.H,
+        template_bin.max_weight, template_bin.max_value, template_bin.gravity, template_bin.cost
+    )
+    rem = []
+    for iid in ordered:
+        if not nb.try_add(ilookup[iid]):
+            rem.append(iid)
+    return nb, rem
+
+def _cover_postprocess(selected_bins, all_item_ids, ilookup, vehicles):
     """
     Convert covering solution (A>=1) into a strict partition by keeping each
     item in one selected bin only (prefer cheaper bins, then lower z).
@@ -748,18 +802,33 @@ def _cover_postprocess(selected_bins, all_item_ids, ilookup):
         if iid not in choice:
             return None
 
-    kept = [[] for _ in selected_bins]
-    for bi, b in enumerate(selected_bins):
-        for rec in b.items:
-            iid = rec[0]
-            if choice[iid][1] == bi:
-                kept[bi].append(rec)
+    assigned = [[] for _ in selected_bins]
+    for iid in all_item_ids:
+        assigned[choice[iid][1]].append(iid)
 
     out = []
-    for bi, recs in enumerate(kept):
-        if not recs:
+    leftovers = []
+    for bi, ids in enumerate(assigned):
+        if not ids:
             continue
-        out.append(_rebuild_bin_subset(selected_bins[bi], recs, ilookup))
+        nb, rem = _pack_assigned_items(selected_bins[bi], ids, ilookup)
+        if nb.items:
+            out.append(nb)
+        leftovers.extend(rem)
+
+    # Repair residual items in feasible placements only.
+    for iid in sorted(leftovers, key=lambda x: -ilookup[x]['vol']):
+        item = ilookup[iid]
+        placed = False
+        for b in sorted(out, key=lambda bb: bb.rem_vol()):
+            if b.try_add(item):
+                placed = True
+                break
+        if not placed:
+            nb = open_bin(item, vehicles)
+            if nb is None:
+                return None
+            out.append(nb)
 
     covered = {rec[0] for b in out for rec in b.items}
     if covered != set(all_item_ids):
@@ -767,7 +836,8 @@ def _cover_postprocess(selected_bins, all_item_ids, ilookup):
     return out
 
 def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
-                        ilookup=None, vehicles=None, warm_keys=None):
+                        ilookup=None, vehicles=None, warm_keys=None,
+                        highs_parallel='on'):
     """
     Solve set covering master (A >= 1), then post-process to exact partition.
     """
@@ -865,7 +935,8 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
         if _HAS_HIGHSPY:
             cover_rows = [A.getrow(i).indices.tolist() for i in range(n_items)]
             x_vals = _solve_cover_highspy(
-                scaled_costs, cover_rows, clique_rows_cols, milp_budget, gap, warm_cols=sorted(warm_cols)
+                scaled_costs, cover_rows, clique_rows_cols, milp_budget, gap,
+                warm_cols=sorted(warm_cols), parallel_mode=highs_parallel
             )
 
         if x_vals is None:
@@ -887,7 +958,7 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
 
         selected = [columns[j] for j in range(n_cols) if x_vals[j] > 0.5]
         if ilookup is not None:
-            selected = _cover_postprocess(selected, all_item_ids, ilookup)
+            selected = _cover_postprocess(selected, all_item_ids, ilookup, vehicles)
             if selected is None:
                 return None, float('inf')
         covered = set()
@@ -992,10 +1063,16 @@ def parse_items(df):
     for iid,row in df.iterrows():
         rots=[int(c) for c in str(row['allowedRotations'])]
         w,d,h=float(row['width']),float(row['depth']),float(row['height'])
+        urots = unique_rots(w,d,h,rots)
+        vol = w*d*h
+        base_area = max(iw*id_ for (_,iw,id_,_) in urots)
         out.append({'id':iid,'w':w,'d':d,'h':h,
                     'weight':float(row['weight']),'value':float(row['value']),
-                    'urots':unique_rots(w,d,h,rots),
-                    'vol':w*d*h,'maxdim':max(w,d,h)})
+                    'urots':urots,
+                    'vol':vol,'maxdim':max(w,d,h),
+                    'base_area':base_area,
+                    'density_w':float(row['weight'])/max(vol,1e-9),
+                    'density_v':float(row['value'])/max(vol,1e-9)})
     return out
 
 def parse_vehicles(df):
@@ -1043,10 +1120,39 @@ class solver_364130(AbstractSolver):
     3-D Bin Packing: EP + GRASP + LNS + Column Generation + Set Partition MILP.
     """
 
-    SOLVE_SECONDS = int(os.getenv('SOLVER_364130_TIME_LIMIT', '545'))
-    N_THREADS     = min(4, max(1, (os.cpu_count() or 4)))
-    VERBOSE       = os.getenv('SOLVER_364130_VERBOSE', '1') != '0'
-    BASE_SEED     = int(os.getenv('SOLVER_364130_SEED', '0'))
+    """CHANGE WITH:
+        
+        SOLVE_SECONDS  = 545
+        DETERMINISTIC  = True
+        N_THREADS      = 1
+        VERBOSE        = False
+        BASE_SEED      = 11
+        HIGHS_PARALLEL = 'off'
+        for deterministic behavior (same solution every run, useful for debugging and local testing).
+        
+        or with 
+        SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '545'))
+        DETERMINISTIC  = os.getenv('SOLVER_364130_DETERMINISTIC', '0') != '0'
+        N_THREADS      = 1 if DETERMINISTIC else min(4, max(1, (os.cpu_count() or 4)))
+        VERBOSE        = os.getenv('SOLVER_364130_VERBOSE', '1') != '0'
+        BASE_SEED      = int(os.getenv('SOLVER_364130_SEED', '11'))
+        HIGHS_PARALLEL = os.getenv(
+            'SOLVER_364130_HIGHS_PARALLEL',
+            'off' if DETERMINISTIC else 'on',
+        )
+    
+    for non-deterministic behavior (potentially better solutions, useful for final submission)."""
+
+    SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '545'))
+    DETERMINISTIC  = os.getenv('SOLVER_364130_DETERMINISTIC', '0') != '0'
+    N_THREADS      = 1 if DETERMINISTIC else min(4, max(1, (os.cpu_count() or 4)))
+    VERBOSE        = os.getenv('SOLVER_364130_VERBOSE', '1') != '0'
+    BASE_SEED      = int(os.getenv('SOLVER_364130_SEED', '11'))
+    HIGHS_PARALLEL = os.getenv(
+        'SOLVER_364130_HIGHS_PARALLEL',
+        'off' if DETERMINISTIC else 'on',
+    )
+  
 
     def __init__(self, inst):
         super().__init__(inst)
@@ -1059,6 +1165,8 @@ class solver_364130(AbstractSolver):
 
         log(f"\n{'═'*65}")
         log(f"  Dataset  :  {self.inst.name}")
+        log(f"  Seed     :  {self.BASE_SEED}  (deterministic={self.DETERMINISTIC})")
+        log(f"  Threads  :  {self.N_THREADS}  (HiGHS parallel={self.HIGHS_PARALLEL})")
         log(f"{'═'*65}")
 
         items         = parse_items(self.inst.df_items)
@@ -1110,14 +1218,16 @@ class solver_364130(AbstractSolver):
         log(f"\n  Phase 1  —  parallel construction")
         t_p1 = t0 + min(45.0, self.SOLVE_SECONDS * 0.10)
 
-        by_vol    = sorted(items, key=lambda x: -x['vol'])
-        by_weight = sorted(items, key=lambda x: (-x['weight'], -x['vol']))
-        by_maxdim = sorted(items, key=lambda x: (-x['maxdim'], -x['vol']))
-        by_value  = sorted(items, key=lambda x: (-x['value'], -x['vol']))
+        by_vol       = build_sequence(items, 'vol', random.Random(seed0 + 101))
+        by_weight    = build_sequence(items, 'weight', random.Random(seed0 + 102))
+        by_maxdim    = build_sequence(items, 'maxdim', random.Random(seed0 + 103))
+        by_value     = build_sequence(items, 'value', random.Random(seed0 + 104))
+        by_footprint = build_sequence(items, 'footprint', random.Random(seed0 + 105))
+        by_densw     = build_sequence(items, 'densw', random.Random(seed0 + 106))
 
         def _worker(label, seq, bf, alpha, seed, vehs):
             rng = random.Random(seed)
-            bins, unp = grasp(seq, vehs, alpha, rng, t_p1, bf)
+            bins, unp = grasp(seq, vehs, alpha, rng, t_p1, bf, honor_order=False)
             if unp:
                 return label, None, float('inf')
             bins = lns(bins, ilookup, vehs, t_p1, rng, verbose=False, pool=pool)
@@ -1135,6 +1245,8 @@ class solver_364130(AbstractSolver):
             ('rnd-bal-bf',    items,     True,  0.14, seed0 + 8, v_orders['balanced']),
             ('large-vol-bf',  by_vol,    True,  0.00, seed0 + 9, v_orders['large']),
             ('bigeff-maxd',   by_maxdim, True,  0.00, seed0 + 10, v_orders['big_eff']),
+            ('fp-bal',        by_footprint, True, 0.00, seed0 + 11, v_orders['balanced']),
+            ('densw-cap',     by_densw, True, 0.00, seed0 + 12, v_orders['capacity']),
         ]
         for j, mono in enumerate(mono_vehicle_lists):
             configs.append((f"mono-{mono[0]['type']}", by_vol, True, 0.06, seed0 + 20 + j, mono))
@@ -1183,13 +1295,40 @@ class solver_364130(AbstractSolver):
 
         def _restart_worker(seed_base):
             rng = random.Random(seed_base)
+            modes = ['vol', 'weight', 'value', 'maxdim', 'footprint', 'densw', 'densv', 'mixed', 'shuffle']
+            if self.DETERMINISTIC:
+                n_restarts = max(40, min(220, len(items) // 6))
+                for _ in range(n_restarts):
+                    if time.monotonic() >= t_p2:
+                        break
+                    slot = max(2.0, min(7.0, (t_p2 - time.monotonic()) / max(1, n_restarts)))
+                    alpha = rng.uniform(0.05, 0.35)
+                    bf    = rng.random() < 0.5
+                    vehs  = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
+                    mode = modes[rng.randrange(len(modes))]
+                    seq = build_sequence(items, mode, rng)
+                    local_end = min(time.monotonic() + slot, t_p2)
+                    bins, unp = grasp(seq, vehs, alpha, rng, local_end, bf, honor_order=False)
+                    with lock:
+                        restarts[0] += 1
+                    if unp:
+                        continue
+                    pool.add_solution(bins)
+                    with lock:
+                        thresh = best_cost[0] * 1.10
+                    if _cost(bins) <= thresh:
+                        lns_end = min(time.monotonic() + slot * 0.65, t_p2)
+                        bins = lns(bins, ilookup, vehs, lns_end, rng, verbose=False, pool=pool)
+                    update_best(bins, 'restart')
+                return
+
             while time.monotonic() < t_p2:
                 alpha = rng.uniform(0.05, 0.35)
                 bf    = rng.random() < 0.5
                 vehs  = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
-                seq   = list(items)
-                rng.shuffle(seq)
-                bins, unp = grasp(seq, vehs, alpha, rng, t_p2, bf)
+                mode = modes[rng.randrange(len(modes))]
+                seq = build_sequence(items, mode, rng)
+                bins, unp = grasp(seq, vehs, alpha, rng, t_p2, bf, honor_order=False)
                 with lock:
                     restarts[0] += 1
                 if unp:
@@ -1240,7 +1379,8 @@ class solver_364130(AbstractSolver):
                 warm_keys = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
             selected, milp_cost = solve_set_partition(
                 cols, all_ids, milp_budget, max_cols=milp_cols,
-                ilookup=ilookup, vehicles=vehicles_all, warm_keys=warm_keys
+                ilookup=ilookup, vehicles=vehicles_all, warm_keys=warm_keys,
+                highs_parallel=self.HIGHS_PARALLEL
             )
             if selected is not None:
                 log(f"  MILP solution: cost={milp_cost:.2f}  bins={len(selected)}")
@@ -1268,7 +1408,8 @@ class solver_364130(AbstractSolver):
                     warm_keys2 = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
                 selected2, milp_cost2 = solve_set_partition(
                     cols2, all_ids, milp_budget2, max_cols=milp_cols2,
-                    ilookup=ilookup, vehicles=vehicles_all, warm_keys=warm_keys2
+                    ilookup=ilookup, vehicles=vehicles_all, warm_keys=warm_keys2,
+                    highs_parallel=self.HIGHS_PARALLEL
                 )
                 if selected2 is not None:
                     log(f"  MILP-2 solution: cost={milp_cost2:.2f}  bins={len(selected2)}")
@@ -1295,15 +1436,77 @@ class solver_364130(AbstractSolver):
 
         # Multi-seed late intensification: short bursts on different vehicle orders.
         seed = seed0 + 2221
-        while time.monotonic() < tend - 2.0:
-            with lock:
-                snap = [b.copy() for b in best_bins[0]]
-            vehs = vehicle_cycle[seed % len(vehicle_cycle)]
-            burst_end = min(time.monotonic() + 4.5, tend - 2.0)
-            cand = lns(snap, ilookup, vehs, burst_end, random.Random(seed),
-                       verbose=False, pool=pool)
-            update_best(cand, f'late-{seed % 1000}')
-            seed += 97
+        late_modes = ['vol', 'weight', 'value', 'maxdim', 'footprint', 'densw', 'densv', 'mixed', 'shuffle']
+        if self.DETERMINISTIC:
+            n_late = 24
+            for i in range(n_late):
+                if time.monotonic() >= tend - 2.0:
+                    break
+                rem = tend - time.monotonic() - 2.0
+                if rem <= 0:
+                    break
+                slot = max(1.2, min(4.5, rem / max(1, n_late - i)))
+                rng_local = random.Random(seed)
+                vehs = vehicle_cycle[seed % len(vehicle_cycle)]
+                burst_end = min(time.monotonic() + slot, tend - 2.0)
+                if seed % 2 == 0:
+                    with lock:
+                        snap = [b.copy() for b in best_bins[0]]
+                    cand = lns(snap, ilookup, vehs, burst_end, rng_local,
+                               verbose=False, pool=pool)
+                    update_best(cand, f'lateL-{seed % 1000}')
+                else:
+                    mode = late_modes[seed % len(late_modes)]
+                    seq = build_sequence(items, mode, rng_local)
+                    alpha = rng_local.uniform(0.02, 0.22)
+                    bf = rng_local.random() < 0.6
+                    cand, unp = grasp(seq, vehs, alpha, rng_local, burst_end, bf, honor_order=False)
+                    if not unp:
+                        cand = lns(cand, ilookup, vehs, burst_end, rng_local,
+                                   verbose=False, pool=pool)
+                        pool.add_solution(cand)
+                        update_best(cand, f'lateR-{seed % 1000}')
+                seed += 97
+        else:
+            while time.monotonic() < tend - 2.0:
+                rng_local = random.Random(seed)
+                vehs = vehicle_cycle[seed % len(vehicle_cycle)]
+                burst_end = min(time.monotonic() + 4.5, tend - 2.0)
+                if seed % 2 == 0:
+                    with lock:
+                        snap = [b.copy() for b in best_bins[0]]
+                    cand = lns(snap, ilookup, vehs, burst_end, rng_local,
+                               verbose=False, pool=pool)
+                    update_best(cand, f'lateL-{seed % 1000}')
+                else:
+                    mode = late_modes[seed % len(late_modes)]
+                    seq = build_sequence(items, mode, rng_local)
+                    alpha = rng_local.uniform(0.02, 0.22)
+                    bf = rng_local.random() < 0.6
+                    cand, unp = grasp(seq, vehs, alpha, rng_local, burst_end, bf, honor_order=False)
+                    if not unp:
+                        cand = lns(cand, ilookup, vehs, burst_end, rng_local,
+                                   verbose=False, pool=pool)
+                        pool.add_solution(cand)
+                        update_best(cand, f'lateR-{seed % 1000}')
+                seed += 97
+
+        # Last tiny exact re-optimization over full column pool.
+        rem = tend - time.monotonic()
+        if rem > 2.5:
+            cols3 = pool.get_columns()
+            if cols3:
+                budget3 = min(6.0, rem - 0.8)
+                cols_cap3 = min(2600, max(1200, len(all_ids) // 2 + 700))
+                with lock:
+                    warm_keys3 = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
+                selected3, milp_cost3 = solve_set_partition(
+                    cols3, all_ids, budget3, max_cols=cols_cap3,
+                    ilookup=ilookup, vehicles=vehicles_all, warm_keys=warm_keys3,
+                    highs_parallel=self.HIGHS_PARALLEL
+                )
+                if selected3 is not None:
+                    update_best(selected3, 'milp-final')
 
         # ─────────────────────────────────────────────────────────────────────
         # Build output with final safety repair

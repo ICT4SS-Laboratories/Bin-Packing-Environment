@@ -1,4 +1,8 @@
-numpy
-pandas
-scipy
-highspy
+# Core dependencies (required)
+numpy>=1.24,<3
+pandas>=2.2,<3
+scipy>=1.10,<2
+
+# Optional: faster MILP backend path used when available
+# If this fails on your platform, solver still works via scipy.optimize.milp.
+highspy>=1.8
