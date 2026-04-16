@@ -11,7 +11,6 @@ Pipeline:
 - improve them with destroy/repair neighborhoods,
 - pick the cheapest exact cover of items via set partition MILP.
 """
-
 import os, time, math, random, threading
 import numpy as np
 import pandas as pd
@@ -1126,16 +1125,16 @@ class solver_364130(AbstractSolver):
         DETERMINISTIC  = True
         N_THREADS      = 1
         VERBOSE        = False
-        BASE_SEED      = 11
+        BASE_SEED      = 15
         HIGHS_PARALLEL = 'off'
         for deterministic behavior (same solution every run, useful for debugging and local testing).
         
         or with 
-        SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '545'))
+        SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '590'))
         DETERMINISTIC  = os.getenv('SOLVER_364130_DETERMINISTIC', '0') != '0'
         N_THREADS      = 1 if DETERMINISTIC else min(4, max(1, (os.cpu_count() or 4)))
         VERBOSE        = os.getenv('SOLVER_364130_VERBOSE', '1') != '0'
-        BASE_SEED      = int(os.getenv('SOLVER_364130_SEED', '11'))
+        BASE_SEED      = int(os.getenv('SOLVER_364130_SEED', '15'))
         HIGHS_PARALLEL = os.getenv(
             'SOLVER_364130_HIGHS_PARALLEL',
             'off' if DETERMINISTIC else 'on',
@@ -1143,11 +1142,11 @@ class solver_364130(AbstractSolver):
     
     for non-deterministic behavior (potentially better solutions, useful for final submission)."""
 
-    SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '545'))
+    SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '590'))
     DETERMINISTIC  = os.getenv('SOLVER_364130_DETERMINISTIC', '0') != '0'
     N_THREADS      = 1 if DETERMINISTIC else min(4, max(1, (os.cpu_count() or 4)))
     VERBOSE        = os.getenv('SOLVER_364130_VERBOSE', '1') != '0'
-    BASE_SEED      = int(os.getenv('SOLVER_364130_SEED', '11'))
+    BASE_SEED      = int(os.getenv('SOLVER_364130_SEED', '15'))
     HIGHS_PARALLEL = os.getenv(
         'SOLVER_364130_HIGHS_PARALLEL',
         'off' if DETERMINISTIC else 'on',
