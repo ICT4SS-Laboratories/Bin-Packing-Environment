@@ -9,8 +9,8 @@ if __name__ == '__main__':
     
     vehicle_to_visualize = 0
 
-    dataset_name = 'DatasetA'
-    solver_name = 'solver_356856'
+    dataset_name = 'DatasetC'
+    solver_name = 'solver_364130'
     inst = Instance(dataset_name)
 
     # -------------------------
