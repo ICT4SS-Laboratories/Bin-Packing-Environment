@@ -6,3 +6,6 @@ scipy>=1.10,<2
 # Optional: faster MILP backend path used when available
 # If this fails on your platform, solver still works via scipy.optimize.milp.
 highspy>=1.8
+
+# Optional: CP-SAT backend used as a second exact optimizer on the column pool.
+ortools>=9.10,<10

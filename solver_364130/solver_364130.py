@@ -26,6 +26,13 @@ except Exception:
     highspy = None
     _HAS_HIGHSPY = False
 
+try:
+    from ortools.sat.python import cp_model
+    _HAS_ORTOOLS = True
+except Exception:
+    cp_model = None
+    _HAS_ORTOOLS = False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROTATION TABLE
@@ -530,6 +537,34 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
             if stag>=40: break
     return cur
 
+def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
+    """
+    Deterministic intensification pass for the incumbent.
+    Applies only strict-improvement moves, so objective cannot worsen.
+    """
+    cur = [b.copy() for b in bins]
+    rng = random.Random(987654321)
+    while time.monotonic() < t_end:
+        imp = False
+        for op in (
+            lambda x: op_elim(x, ilookup, vehicles, t_end),
+            lambda x: op_retype(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_merge3(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_eject(x, ilookup, vehicles, rng, t_end, destroy_rate=0.45),
+        ):
+            new, ok = op(cur)
+            if ok and _cost(new) < _cost(cur) - 1e-9:
+                cur = new
+                imp = True
+                if pool:
+                    pool.add_solution(cur)
+                break
+            if time.monotonic() >= t_end:
+                break
+        if not imp:
+            break
+    return cur
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  GRASP construction
@@ -726,6 +761,52 @@ def _solve_cover_highspy(
         return vals
     except Exception as e:
         print(f'  [highspy] error: {e}')
+        return None
+
+def _solve_cover_cpsat(
+    scaled_costs, cover_rows, clique_rows, t_budget, gap,
+    warm_cols=None, n_workers=4, seed=1
+):
+    if not _HAS_ORTOOLS or t_budget <= 0.5:
+        return None
+    try:
+        m = cp_model.CpModel()
+        n = len(scaled_costs)
+        x = [m.NewBoolVar(f'x{j}') for j in range(n)]
+
+        scale = 1_000_000
+        int_costs = [max(1, int(round(float(c) * scale))) for c in scaled_costs]
+        m.Minimize(sum(int_costs[j] * x[j] for j in range(n)))
+
+        for cols in cover_rows:
+            if not cols:
+                return None
+            m.Add(sum(x[int(j)] for j in cols) >= 1)
+
+        # Columns in each clique row are forbidden together (sum <= 0).
+        for cols in clique_rows:
+            if cols:
+                m.Add(sum(x[int(j)] for j in cols) <= 0)
+
+        if warm_cols:
+            for j in sorted(set(int(c) for c in warm_cols)):
+                if 0 <= j < n:
+                    m.AddHint(x[j], 1)
+
+        s = cp_model.CpSolver()
+        s.parameters.max_time_in_seconds = float(max(0.5, t_budget))
+        s.parameters.num_search_workers = int(max(1, n_workers))
+        s.parameters.random_seed = int(seed)
+        s.parameters.relative_gap_limit = float(max(1e-6, gap))
+        s.parameters.log_search_progress = False
+
+        status = s.Solve(m)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            return None
+
+        return np.asarray([float(s.Value(v)) for v in x], dtype=np.float64)
+    except Exception as e:
+        print(f'  [cp-sat] error: {e}')
         return None
 
 
@@ -930,42 +1011,70 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
                 if j is not None:
                     warm_cols.add(j)
 
-        x_vals = None
+        cover_rows = [A.getrow(i).indices.tolist() for i in range(n_items)]
+        candidate_x = []
+
+        use_cpsat = _HAS_ORTOOLS and n_cols <= 3200 and milp_budget >= 6.0
+        cpsat_budget = min(6.0, milp_budget * 0.20) if use_cpsat else 0.0
+        main_budget = max(2.0, milp_budget - cpsat_budget)
+
+        x_main = None
         if _HAS_HIGHSPY:
-            cover_rows = [A.getrow(i).indices.tolist() for i in range(n_items)]
-            x_vals = _solve_cover_highspy(
-                scaled_costs, cover_rows, clique_rows_cols, milp_budget, gap,
+            x_main = _solve_cover_highspy(
+                scaled_costs, cover_rows, clique_rows_cols, main_budget, gap,
                 warm_cols=sorted(warm_cols), parallel_mode=highs_parallel
             )
 
-        if x_vals is None:
+        if x_main is None:
             result = milp(
                 scaled_costs,
                 constraints=constraints,
                 integrality=integrality,
                 bounds=bounds,
                 options={
-                    'time_limit': milp_budget,
+                    'time_limit': main_budget,
                     'disp': False,
                     'mip_rel_gap': gap,
                     'presolve': True,
                 }
             )
-            if result.x is None:
-                return None, float('inf')
-            x_vals = result.x
+            if result.x is not None:
+                x_main = result.x
 
-        selected = [columns[j] for j in range(n_cols) if x_vals[j] > 0.5]
-        if ilookup is not None:
-            selected = _cover_postprocess(selected, all_item_ids, ilookup, vehicles)
-            if selected is None:
-                return None, float('inf')
-        covered = set()
-        for b in selected:
-            for (iid, *_) in b.items:
-                covered.add(iid)
-        if covered == all_set:
-            return selected, float(sum(b.cost for b in selected))
+        if x_main is not None:
+            candidate_x.append(x_main)
+
+        if use_cpsat and cpsat_budget > 1.0:
+            x_cp = _solve_cover_cpsat(
+                scaled_costs,
+                cover_rows,
+                clique_rows_cols,
+                cpsat_budget,
+                gap=max(gap, 5e-5),
+                warm_cols=sorted(warm_cols),
+                n_workers=min(8, max(1, os.cpu_count() or 4)),
+                seed=(len(all_item_ids) * 131 + n_cols * 17 + 7),
+            )
+            if x_cp is not None:
+                candidate_x.append(x_cp)
+
+        best_selected = None
+        best_obj = float('inf')
+        for x_vals in candidate_x:
+            selected = [columns[j] for j in range(n_cols) if x_vals[j] > 0.5]
+            if ilookup is not None:
+                selected = _cover_postprocess(selected, all_item_ids, ilookup, vehicles)
+                if selected is None:
+                    continue
+            covered = {iid for b in selected for (iid, *_) in b.items}
+            if covered == all_set:
+                obj = float(sum(b.cost for b in selected))
+                if obj < best_obj - 1e-9:
+                    best_obj = obj
+                    best_selected = selected
+
+        if best_selected is not None:
+            return best_selected, best_obj
 
     except Exception as e:
         print(f'  [MILP] error: {e}')
@@ -1142,7 +1251,7 @@ class solver_364130(AbstractSolver):
     
     for non-deterministic behavior (potentially better solutions, useful for final submission)."""
 
-    SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '590'))
+    SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '600'))
     DETERMINISTIC  = os.getenv('SOLVER_364130_DETERMINISTIC', '0') != '0'
     N_THREADS      = 1 if DETERMINISTIC else min(4, max(1, (os.cpu_count() or 4)))
     VERBOSE        = os.getenv('SOLVER_364130_VERBOSE', '1') != '0'
@@ -1184,6 +1293,11 @@ class solver_364130(AbstractSolver):
         ]
         name_seed     = sum((i + 1) * ord(ch) for i, ch in enumerate(self.inst.name))
         seed0         = 1009 + name_seed + self.BASE_SEED * 100_003
+        portfolio_seed0 = [seed0]
+        if not self.DETERMINISTIC:
+            for s in (2, 7, 19):
+                if s != self.BASE_SEED:
+                    portfolio_seed0.append(1009 + name_seed + s * 100_003)
 
         ilookup = {it['id']: it for it in items}
         all_ids = sorted(ilookup.keys())
@@ -1343,7 +1457,8 @@ class solver_364130(AbstractSolver):
         with ThreadPoolExecutor(max_workers=self.N_THREADS) as ex:
             futures = [ex.submit(_deep_lns)]
             for k in range(self.N_THREADS - 1):
-                futures.append(ex.submit(_restart_worker, seed0 + 3000 + k * 1337))
+                root = portfolio_seed0[k % len(portfolio_seed0)]
+                futures.append(ex.submit(_restart_worker, root + 3000 + k * 1337))
             for f in as_completed(futures):
                 try:
                     f.result()
@@ -1370,8 +1485,9 @@ class solver_364130(AbstractSolver):
         cols = pool.get_columns()
         log(f"  Column pool size: {len(cols)}")
 
-        milp_budget = min(50.0, tend - time.monotonic() - 18.0)
+        milp_budget = min(34.0, tend - time.monotonic() - 24.0)
         milp_cols   = min(2200, max(1000, len(all_ids) // 2 + 500))
+        milp_improved = False
         if milp_budget > 5.0 and cols:
             log(f"  Running MILP  (budget={milp_budget:.0f}s, cols={milp_cols}) ...")
             with lock:
@@ -1383,7 +1499,7 @@ class solver_364130(AbstractSolver):
             )
             if selected is not None:
                 log(f"  MILP solution: cost={milp_cost:.2f}  bins={len(selected)}")
-                update_best(selected, 'milp')
+                milp_improved = update_best(selected, 'milp') or milp_improved
             else:
                 log('  MILP: no feasible solution found in column pool')
         else:
@@ -1399,9 +1515,10 @@ class solver_364130(AbstractSolver):
             )
             cols2 = pool.get_columns()
             log(f"  Column pool after intensification: {len(cols2)}")
-            milp_budget2 = min(22.0, tend - time.monotonic() - 8.0)
+            milp_budget2 = min(12.0, tend - time.monotonic() - 10.0)
             milp_cols2 = min(2400, milp_cols + 400)
-            if milp_budget2 > 4.0 and cols2:
+            run_milp2 = milp_improved or (len(cols2) >= len(cols) + 120)
+            if milp_budget2 > 4.0 and cols2 and run_milp2:
                 log(f"  Running MILP-2 (budget={milp_budget2:.0f}s, cols={milp_cols2}) ...")
                 with lock:
                     warm_keys2 = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
@@ -1413,6 +1530,8 @@ class solver_364130(AbstractSolver):
                 if selected2 is not None:
                     log(f"  MILP-2 solution: cost={milp_cost2:.2f}  bins={len(selected2)}")
                     update_best(selected2, 'milp-2')
+            elif milp_budget2 > 4.0 and cols2:
+                log("  MILP-2 skipped (not promising after MILP-1)")
 
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 4 — Final polish
@@ -1489,6 +1608,15 @@ class solver_364130(AbstractSolver):
                         pool.add_solution(cand)
                         update_best(cand, f'lateR-{seed % 1000}')
                 seed += 97
+
+        # Deterministic incumbent polishing (cannot worsen objective).
+        rem = tend - time.monotonic()
+        if rem > 6.0:
+            with lock:
+                snap = [b.copy() for b in best_bins[0]]
+            polish_end = min(tend - 3.0, time.monotonic() + min(12.0, rem - 3.0))
+            polished = post_optimize_bins(snap, ilookup, v_orders['cost'], polish_end, pool=pool)
+            update_best(polished, 'post-opt')
 
         # Last tiny exact re-optimization over full column pool.
         rem = tend - time.monotonic()
