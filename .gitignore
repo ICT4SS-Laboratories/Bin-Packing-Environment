@@ -15,3 +15,7 @@ __pycache__/
 
 # Copilot instructions
 .github/
+
+# Not modify main.py or results_checker.py
+main.py
+results_checker.py
