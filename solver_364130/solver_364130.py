@@ -1992,6 +1992,18 @@ class solver_364130(AbstractSolver):
                 if selected3 is not None:
                     update_best(selected3, 'milp-final')
 
+        # Ultra-final aggressive eject in last 1.5 seconds
+        rem = tend - time.monotonic()
+        if rem > 1.0:
+            with lock:
+                snap = [b.copy() for b in best_bins[0]]
+            eject_end = min(tend - 0.3, time.monotonic() + min(1.0, rem - 0.3))
+            rng_final = random.Random(seed0 + 88888)
+            for _ in range(3):
+                if time.monotonic() > eject_end: break
+                snap, ok = op_eject_expensive(snap, ilookup, vehicles, rng_final, eject_end, destroy_rate=0.45)
+                if ok: update_best(snap, 'final-eject')
+
         # ─────────────────────────────────────────────────────────────────────
         # Build output with final safety repair
         # ─────────────────────────────────────────────────────────────────────
