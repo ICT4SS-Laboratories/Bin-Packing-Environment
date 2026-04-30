@@ -747,6 +747,24 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
                 break
         if not imp:
             break
+    
+    # Extra polishing: try elim + retype again (often they find more improvements on refined solutions)
+    for _ in range(2):
+        if time.monotonic() >= t_end:
+            break
+        new, ok = op_elim(cur, ilookup, vehicles, t_end)
+        if ok and _cost(new) < _cost(cur) - 1e-9:
+            cur = new
+            if pool:
+                pool.add_solution(cur)
+        if time.monotonic() >= t_end:
+            break
+        new, ok = op_retype(cur, ilookup, vehicles, rng, t_end)
+        if ok and _cost(new) < _cost(cur) - 1e-9:
+            cur = new
+            if pool:
+                pool.add_solution(cur)
+    
     return cur
 
 
@@ -1523,6 +1541,8 @@ class solver_364130(AbstractSolver):
         by_value     = build_sequence(items, 'value', random.Random(seed0 + 104))
         by_footprint = build_sequence(items, 'footprint', random.Random(seed0 + 105))
         by_densw     = build_sequence(items, 'densw', random.Random(seed0 + 106))
+        by_densv     = build_sequence(items, 'densv', random.Random(seed0 + 107))
+        by_mixed     = build_sequence(items, 'mixed', random.Random(seed0 + 108))
 
         def _worker(label, seq, bf, alpha, seed, vehs):
             rng = random.Random(seed)
@@ -1546,6 +1566,10 @@ class solver_364130(AbstractSolver):
             ('bigeff-maxd',   by_maxdim, True,  0.00, seed0 + 10, v_orders['big_eff']),
             ('fp-bal',        by_footprint, True, 0.00, seed0 + 11, v_orders['balanced']),
             ('densw-cap',     by_densw, True, 0.00, seed0 + 12, v_orders['capacity']),
+            ('densv-cost',    by_densv, True, 0.08, seed0 + 13, v_orders['cost']),
+            ('mixed-bal-bf',  by_mixed, True, 0.10, seed0 + 14, v_orders['balanced']),
+            ('rnd-ag-bf',     items,    True, 0.22, seed0 + 15, v_orders['big_eff']),
+            ('mixed-cpv',     by_mixed, False, 0.06, seed0 + 16, v_orders['cpv']),
         ]
         for j, mono in enumerate(mono_vehicle_lists):
             configs.append((f"mono-{mono[0]['type']}", by_vol, True, 0.06, seed0 + 20 + j, mono))
