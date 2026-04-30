@@ -1800,6 +1800,16 @@ class solver_364130(AbstractSolver):
                 for b in generate_columns_for_item(item, items, vehs, 4, rng_cg, t_cg):
                     pool.add_bin(b)
 
+        # Extra seeding for small datasets: focus on value-density and footprint
+        if small and time.monotonic() < t_cg - 1.5:
+            density_items = sorted(items, key=lambda x: -x['density_v'])[:min(8, len(items))]
+            for i, item in enumerate(density_items):
+                if time.monotonic() > t_cg:
+                    break
+                vehs = vehicle_cycle[(i + 7) % len(vehicle_cycle)]
+                for b in generate_columns_for_item(item, items, vehs, 3, rng_cg, t_cg):
+                    pool.add_bin(b)
+
         cols = pool.get_columns()
         log(f"  Column pool size: {len(cols)}")
 
@@ -1868,6 +1878,17 @@ class solver_364130(AbstractSolver):
                     update_best(selected2, 'milp-2')
             elif milp_budget2 > 4.0 and cols2:
                 log("  MILP-2 skipped (not promising after MILP-1)")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # PHASE 3b — Extra polish for small datasets
+        # ─────────────────────────────────────────────────────────────────────
+        if small and time.monotonic() < tend - 20.0:
+            log(f"  Phase 3b — small-dataset extra polish ({int(tend - time.monotonic())} s left)")
+            with lock:
+                snap = [b.copy() for b in best_bins[0]]
+            polish_end = min(time.monotonic() + 12.0, tend - 18.0)
+            snap = post_optimize_bins(snap, ilookup, vehicles, polish_end, pool=pool)
+            update_best(snap, 'phase3b-polish')
 
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 4 — Final polish
