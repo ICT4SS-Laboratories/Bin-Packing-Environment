@@ -1167,6 +1167,16 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
     if row_sums.min() < 0.5:
         return None, float('inf')   # some item uncoverable in this pool
 
+    # ── Validate matrix integrity ─────────────────────────────────────────
+    if A.shape[0] == 0 or A.shape[1] == 0:
+        return None, float('inf')
+    if not np.isfinite(costs).all():
+        print(f'  [WARN] Non-finite costs detected, clamping')
+        costs = np.nan_to_num(costs, nan=1e6, posinf=1e6, neginf=1.0)
+    if A.nnz == 0:
+        print(f'  [WARN] Empty coverage matrix')
+        return None, float('inf')
+
     n_items = len(all_item_ids)
     n_cols  = len(columns)
 
@@ -1250,26 +1260,34 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
 
         x_main = None
         if _HAS_HIGHSPY:
-            x_main = _solve_cover_highspy(
-                scaled_costs, cover_rows, clique_rows_cols, main_budget, gap,
-                warm_cols=sorted(warm_cols), parallel_mode=highs_parallel
-            )
+            try:
+                x_main = _solve_cover_highspy(
+                    scaled_costs, cover_rows, clique_rows_cols, main_budget, gap,
+                    warm_cols=sorted(warm_cols), parallel_mode=highs_parallel
+                )
+            except Exception as e:
+                print(f'  [HiGHS] crashed: {str(e)[:80]}; fallback to scipy')
+                x_main = None
 
         if x_main is None:
-            result = milp(
-                scaled_costs,
-                constraints=constraints,
-                integrality=integrality,
-                bounds=bounds,
-                options={
-                    'time_limit': main_budget,
-                    'disp': False,
-                    'mip_rel_gap': gap,
-                    'presolve': True,
-                }
-            )
-            if result.x is not None:
-                x_main = result.x
+            try:
+                result = milp(
+                    scaled_costs,
+                    constraints=constraints,
+                    integrality=integrality,
+                    bounds=bounds,
+                    options={
+                        'time_limit': main_budget,
+                        'disp': False,
+                        'mip_rel_gap': gap,
+                        'presolve': True,
+                    }
+                )
+                if result.x is not None:
+                    x_main = result.x
+            except Exception as e:
+                print(f'  [MILP] error: {str(e)[:80]}')
+                x_main = None
 
         if x_main is not None:
             candidate_x.append(x_main)
