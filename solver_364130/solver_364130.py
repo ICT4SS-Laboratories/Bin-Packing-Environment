@@ -345,6 +345,34 @@ def op_eject(bins, ilookup, vehicles, rng, t_end, destroy_rate=0.33):
         if _cost(result)<_cost(bins)-1e-9: return result,True
     return bins,False
 
+def op_eject_expensive(bins, ilookup, vehicles, rng, t_end, destroy_rate=0.40):
+    """Eject from most expensive bins (cost-targeted elimination)."""
+    if len(bins)<2: return bins,False
+    ranked = sorted(range(len(bins)), key=lambda i: bins[i].cost, reverse=True)
+    for bi in ranked[:min(4, len(ranked))]:
+        if time.monotonic()>t_end: return bins,False
+        b = bins[bi]
+        if not b.items: continue
+        n = max(1, int(len(b.items) * destroy_rate))
+        eject_recs = rng.sample(b.items, min(n, len(b.items)))
+        eject_ids = {r[0] for r in eject_recs}
+        eject_items = [ilookup[r[0]] for r in eject_recs]
+        src = Bin3D(b.vtype, b.W, b.D, b.H, b.max_weight, b.max_value, b.gravity, b.cost)
+        for rec in b.items:
+            if rec[0] not in eject_ids: src.try_add(ilookup[rec[0]])
+        work = [bins[i].copy() for i in range(len(bins)) if i != bi]
+        work.insert(bi, src)
+        others = [work[i] for i in range(len(work)) if i != bi]
+        ok = True
+        for it in sorted(eject_items, key=lambda x: -x['vol']):
+            if time.monotonic() > t_end: return bins, False
+            placed = any(ob.try_add(it) for ob in others)
+            if not placed: ok = False; break
+        if ok:
+            result = [work[i] for i in range(len(work)) if i != bi] if not src.items else work
+            if _cost(result) < _cost(bins) - 1e-9: return result, True
+    return bins, False
+
 def _can_host_all(items, v):
     tw = sum(it['weight'] for it in items)
     tv = sum(it['value']  for it in items)
