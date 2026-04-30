@@ -1667,9 +1667,9 @@ class solver_364130(AbstractSolver):
         # Stop restart-heavy exploration when Phase 2 is clearly saturated.
         # This avoids burning minutes on unproductive GRASP loops and shifts
         # budget to exact/finishing phases.
-        stagnation_limit = 35.0 if small else (50.0 if very_large else 42.0)
-        full_pool_trigger = int(ColumnPool._MAX_POOL * 0.97)
-        min_restarts_for_stop = max(80, len(items) // 5)
+        stagnation_limit = 35.0 if small else (60.0 if very_large else 42.0)
+        full_pool_trigger = int(ColumnPool._MAX_POOL * 0.95) if very_large else int(ColumnPool._MAX_POOL * 0.97)
+        min_restarts_for_stop = max(60, len(items) // 7) if very_large else max(80, len(items) // 5)
 
         def _phase2_should_stop():
             now = time.monotonic()
