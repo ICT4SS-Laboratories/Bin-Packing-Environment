@@ -2077,3 +2077,4 @@ class solver_364130(AbstractSolver):
         }
         self.write_solution_to_file()
         log(f"  → results/sol_{self.inst.name}_{self.name}.csv")
+        return result, total
