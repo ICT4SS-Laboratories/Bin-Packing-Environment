@@ -184,6 +184,23 @@ def open_bin(item, vehicles):
         if b.try_add(item): return b
     return None
 
+def open_bin_eff(item, vehicles):
+    """Open vehicle minimizing cost-per-usable-capacity. Encourages efficient vehicle selection."""
+    best_bin = None
+    best_score = float('inf')
+    for v in vehicles:
+        if item['weight']>v['max_weight']+1e-9: continue
+        if item['value'] >v['max_value'] +1e-9: continue
+        if not item_fits(item,v): continue
+        cap = min(v['max_weight'], v['max_value']) if v['max_value'] < 1e14 else v['max_weight']
+        score = v['cost'] / max(1.0, cap)
+        if score < best_score - 1e-12:
+            b=Bin3D(v['type'],v['W'],v['D'],v['H'],v['max_weight'],v['max_value'],v['gravity'],v['cost'])
+            if b.try_add(item):
+                best_bin = b
+                best_score = score
+    return best_bin
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PACKING  —  First-Fit / Best-Fit
@@ -282,8 +299,7 @@ def _repack(to_place, existing, vehicles, t_end):
     for item in sorted(to_place, key=lambda x:-x['vol']):
         if time.monotonic()>t_end: return work, False
         placed=False
-        # Best-fit over current bins improves elimination opportunities.
-        for b in sorted(work, key=lambda bb: bb.rem_vol()):
+        for b in work:
             if b.try_add(item): placed=True; break
         if not placed:
             nb=open_bin(item,vehicles)
@@ -294,12 +310,7 @@ def _repack(to_place, existing, vehicles, t_end):
 def op_elim(bins, ilookup, vehicles, t_end):
     if len(bins)<=1: return bins,False
     order=sorted(range(len(bins)),key=lambda i:len(bins[i].items))
-    n_try = 8
-    if len(bins) >= 100:
-        n_try = 16
-    elif len(bins) >= 60:
-        n_try = 12
-    for idx in order[:min(n_try,len(bins))]:
+    for idx in order[:min(8,len(bins))]:
         if time.monotonic()>t_end: break
         to_move=[ilookup[r[0]] for r in bins[idx].items]
         others=[bins[i] for i in range(len(bins)) if i!=idx]
@@ -345,33 +356,434 @@ def op_eject(bins, ilookup, vehicles, rng, t_end, destroy_rate=0.33):
         if _cost(result)<_cost(bins)-1e-9: return result,True
     return bins,False
 
-def op_eject_expensive(bins, ilookup, vehicles, rng, t_end, destroy_rate=0.40):
-    """Eject from most expensive bins (cost-targeted elimination)."""
-    if len(bins)<2: return bins,False
-    ranked = sorted(range(len(bins)), key=lambda i: bins[i].cost, reverse=True)
-    for bi in ranked[:min(4, len(ranked))]:
-        if time.monotonic()>t_end: return bins,False
-        b = bins[bi]
-        if not b.items: continue
-        n = max(1, int(len(b.items) * destroy_rate))
-        eject_recs = rng.sample(b.items, min(n, len(b.items)))
-        eject_ids = {r[0] for r in eject_recs}
-        eject_items = [ilookup[r[0]] for r in eject_recs]
-        src = Bin3D(b.vtype, b.W, b.D, b.H, b.max_weight, b.max_value, b.gravity, b.cost)
-        for rec in b.items:
-            if rec[0] not in eject_ids: src.try_add(ilookup[rec[0]])
-        work = [bins[i].copy() for i in range(len(bins)) if i != bi]
-        work.insert(bi, src)
-        others = [work[i] for i in range(len(work)) if i != bi]
+def op_relocate(bins, ilookup, vehicles, rng, t_end):
+    """Try to fully empty worst bin, relocating its items into others. If all relocate, bin removed -> cost savings."""
+    if len(bins) < 2:
+        return bins, False
+    def _quality(b):
+        util = b.weight / max(1.0, b.max_weight) + b.vol_used / max(1.0, b.W*b.D*b.H)
+        return (util / max(1.0, b.cost), len(b.items))
+    order = sorted(range(len(bins)), key=lambda i: _quality(bins[i]))
+    n_try = min(8, len(order))
+    for ai in order[:n_try]:
+        if time.monotonic() > t_end:
+            return bins, False
+        a = bins[ai]
+        if not a.items:
+            new = [bins[k].copy() for k in range(len(bins)) if k != ai]
+            return new, True
+        items_in_a = [ilookup[r[0]] for r in a.items]
+        items_in_a.sort(key=lambda x: -x['vol'])
+        others = [bins[i].copy() for i in range(len(bins)) if i != ai]
         ok = True
-        for it in sorted(eject_items, key=lambda x: -x['vol']):
-            if time.monotonic() > t_end: return bins, False
-            placed = any(ob.try_add(it) for ob in others)
-            if not placed: ok = False; break
-        if ok:
-            result = [work[i] for i in range(len(work)) if i != bi] if not src.items else work
-            if _cost(result) < _cost(bins) - 1e-9: return result, True
+        for it in items_in_a:
+            if time.monotonic() > t_end:
+                return bins, False
+            placed = False
+            for bo in sorted(others, key=lambda bb: bb.rem_vol()):
+                if bo.try_add(it):
+                    placed = True
+                    break
+            if not placed:
+                ok = False
+                break
+        if ok and _cost(others) < _cost(bins) - 1e-9:
+            return others, True
     return bins, False
+
+def op_swap_pair(bins, ilookup, vehicles, rng, t_end):
+    """Pairwise item swaps between bins. Accepts only strict cost decreases."""
+    if len(bins) < 2:
+        return bins, False
+    n = len(bins)
+    pairs_tried = 0
+    max_pairs = 12 if n < 30 else (16 if n < 100 else 20)
+    expensive = sorted(range(n), key=lambda i: bins[i].cost, reverse=True)
+    for ai in expensive[:min(6, n)]:
+        if pairs_tried >= max_pairs:
+            break
+        bi_choices = [i for i in range(n) if i != ai]
+        rng.shuffle(bi_choices)
+        for bi in bi_choices[:min(4, len(bi_choices))]:
+            if time.monotonic() > t_end:
+                return bins, False
+            pairs_tried += 1
+            a, b = bins[ai], bins[bi]
+            if not a.items or not b.items:
+                continue
+            ra_pool = rng.sample(a.items, min(6, len(a.items)))
+            rb_pool = rng.sample(b.items, min(6, len(b.items)))
+            for ra in ra_pool:
+                ia = ilookup[ra[0]]
+                a_new = Bin3D(a.vtype,a.W,a.D,a.H,a.max_weight,a.max_value,a.gravity,a.cost)
+                for r2 in a.items:
+                    if r2[0] != ra[0]:
+                        a_new.try_add(ilookup[r2[0]])
+                for rb in rb_pool:
+                    if time.monotonic() > t_end:
+                        return bins, False
+                    if ra[0] == rb[0]:
+                        continue
+                    ib = ilookup[rb[0]]
+                    b_new = Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
+                    for r2 in b.items:
+                        if r2[0] != rb[0]:
+                            b_new.try_add(ilookup[r2[0]])
+                    if not a_new.try_add(ib):
+                        continue
+                    if not b_new.try_add(ia):
+                        continue
+                    test_bins = [bins[k].copy() for k in range(n)]
+                    test_bins[ai] = a_new
+                    test_bins[bi] = b_new
+                    if _cost(test_bins) < _cost(bins) - 1e-9:
+                        return test_bins, True
+    return bins, False
+
+
+def op_consolidate_pair(bins, ilookup, vehicles, rng, t_end):
+    """
+    Deterministic pairwise bin merge.
+    Scans pairs (i, j) ordered by combined cost (most expensive first) and
+    attempts to repack their items into ONE bin across ALL vehicle types.
+    Accepts the first strict-improvement.
+
+    More systematic than op_shake (which samples randomly) and complements
+    op_merge3 (which targets triples).
+    """
+    n = len(bins)
+    if n < 2:
+        return bins, False
+
+    # Order bins by cost desc — focus on expensive bins first
+    ranked = sorted(range(n), key=lambda i: -bins[i].cost)
+    head = ranked[:min(12, n)]  # cap workload
+
+    # Build candidate pairs (i, j) with j != i
+    pairs = []
+    for ai in head:
+        for bj in ranked:
+            if bj == ai:
+                continue
+            pair = (min(ai, bj), max(ai, bj))
+            pairs.append(pair)
+    seen_pairs = set()
+    uniq_pairs = []
+    for p in pairs:
+        if p not in seen_pairs:
+            seen_pairs.add(p)
+            uniq_pairs.append(p)
+    # Score by combined cost desc — expensive merges have biggest payoff
+    uniq_pairs.sort(key=lambda p: -(bins[p[0]].cost + bins[p[1]].cost))
+    uniq_pairs = uniq_pairs[:min(40, len(uniq_pairs))]
+
+    for ai, bj in uniq_pairs:
+        if time.monotonic() > t_end:
+            return bins, False
+        a = bins[ai]
+        b = bins[bj]
+        old_cost = a.cost + b.cost
+        ids = list(dict.fromkeys([rec[0] for rec in a.items] + [rec[0] for rec in b.items]))
+        items = [ilookup[iid] for iid in ids]
+        # Quick capacity-feasibility filter: total weight/value/vol
+        tw = sum(it['weight'] for it in items)
+        tv = sum(it['value'] for it in items)
+        tvol = sum(it['vol'] for it in items)
+        # Try cheapest viable vehicle that fits totals
+        viable = []
+        for v in vehicles:
+            if v['cost'] >= old_cost - 1e-9:
+                continue
+            if tw > v['max_weight'] + 1e-9 or tv > v['max_value'] + 1e-9:
+                continue
+            if tvol > v['vol'] + 1e-9:
+                continue
+            if not all(item_fits(it, v) for it in items):
+                continue
+            viable.append(v)
+        if not viable:
+            continue
+        # Try cheapest first; if it fails, try next 2 cheapest
+        viable.sort(key=lambda v: v['cost'])
+        for v in viable[:3]:
+            if time.monotonic() > t_end:
+                return bins, False
+            nb = _pack_exact(items, v, t_end, rng)
+            if nb is None:
+                continue
+            if nb.cost < old_cost - 1e-9:
+                keep = [bins[k].copy() for k in range(n) if k != ai and k != bj]
+                keep.append(nb)
+                return keep, True
+            break  # next cheaper vehicle won't help if this denser one already failed cost-wise
+    return bins, False
+
+
+def op_ruin_recreate(bins, ilookup, vehicles, rng, t_end, ruin_frac=0.30):
+    """
+    Strong global ruin-and-recreate.
+    Removes ~ruin_frac fraction of items spread across multiple bins, then
+    rebuilds: first try to fit removed items into surviving bins, otherwise
+    open new bins with cheapest-fit vehicle selection.
+    Accepts only strict improvements.
+
+    Differs from op_eject (which targets one bin and only repacks into others)
+    by scattering removal across the solution and allowing new bins to open —
+    this escapes local optima that single-bin moves can't.
+    """
+    n = len(bins)
+    if n < 2:
+        return bins, False
+    total_items = sum(len(b.items) for b in bins)
+    if total_items < 4:
+        return bins, False
+    n_remove = max(2, int(total_items * ruin_frac))
+    n_remove = min(n_remove, total_items - 1)
+
+    # Bias removal toward items in expensive/under-utilized bins
+    cand = []  # (score, bin_idx, item_record)
+    for bi, b in enumerate(bins):
+        util = b.vol_used / max(1.0, b.W * b.D * b.H)
+        # higher score = more likely to remove
+        s = b.cost / max(0.05, util)
+        for rec in b.items:
+            jitter = rng.random() * 0.5
+            cand.append((s + jitter, bi, rec))
+    cand.sort(key=lambda x: -x[0])
+    chosen = cand[:n_remove]
+
+    # Build surviving bins (with items kept)
+    keep_per_bin = {bi: [] for bi in range(n)}
+    removed_set = set()
+    for _, bi, rec in chosen:
+        removed_set.add((bi, rec[0]))
+    for bi, b in enumerate(bins):
+        for rec in b.items:
+            if (bi, rec[0]) not in removed_set:
+                keep_per_bin[bi].append(ilookup[rec[0]])
+
+    # Reconstruct surviving bins from scratch (re-pack kept items)
+    surv = []
+    for bi, b in enumerate(bins):
+        kept = keep_per_bin[bi]
+        if not kept:
+            continue
+        nb = Bin3D(b.vtype, b.W, b.D, b.H, b.max_weight, b.max_value, b.gravity, b.cost)
+        # large-first to keep packing density
+        ok = True
+        for it in sorted(kept, key=lambda x: -x['vol']):
+            if time.monotonic() > t_end:
+                return bins, False
+            if not nb.try_add(it):
+                ok = False
+                break
+        if not ok:
+            return bins, False
+        surv.append(nb)
+
+    removed_items = [ilookup[rec[0]] for _, _, rec in chosen]
+    removed_items.sort(key=lambda x: -x['vol'])
+
+    # Place removed items: first into existing bins (best-fit by remaining vol),
+    # then open new bins with cheapest-cost vehicle that fits.
+    work = surv
+    for it in removed_items:
+        if time.monotonic() > t_end:
+            return bins, False
+        placed = False
+        # best-fit among existing
+        best_b = None
+        best_rem = float('inf')
+        for bb in work:
+            if not bb.cap_ok(it['weight'], it['value']):
+                continue
+            for (rot, iw, id_, ih) in it['urots']:
+                if iw > bb.W + 1e-9 or id_ > bb.D + 1e-9 or ih > bb.H + 1e-9:
+                    continue
+                pos = bb.find_ep(iw, id_, ih, it['weight'], it['value'])
+                if pos:
+                    rem = bb.rem_vol() - iw * id_ * ih
+                    if rem < best_rem:
+                        best_rem = rem
+                        best_b = bb
+                    break
+        if best_b is not None and best_b.try_add(it):
+            placed = True
+        if not placed:
+            nb = open_bin(it, vehicles)
+            if nb is None:
+                return bins, False
+            work.append(nb)
+    if _cost(work) < _cost(bins) - 1e-9:
+        return work, True
+    return bins, False
+
+
+def op_weight_pair_repack(bins, ilookup, vehicles, rng, t_end):
+    """
+    Pair single-item bins of the SAME vehicle type into 2-item (or 3-item) bins.
+    Uses 2-pointer (lightest + heaviest) which is optimal for 1D weight matching.
+
+    Targets the case where a vehicle's weight capacity is the binding constraint
+    and items are being placed alone wasting capacity. Pairing reduces bin count.
+
+    Feasibility: each new bin is built via Bin3D.try_add() which enforces
+    overlap, weight/value caps, gravity and dim fit. Strict-improvement only.
+    """
+    n = len(bins)
+    if n < 4:
+        return bins, False
+
+    # Index single-item bins by vehicle type
+    single = {}
+    for i, b in enumerate(bins):
+        if len(b.items) == 1:
+            single.setdefault(b.vtype, []).append(i)
+    if not any(len(v) >= 2 for v in single.values()):
+        return bins, False
+
+    # Build vehicle-spec lookup
+    vmap = {v['type']: v for v in vehicles}
+
+    consumed = set()
+    new_bins = []
+    for vtype, indices in single.items():
+        if len(indices) < 2 or vtype not in vmap:
+            continue
+        if time.monotonic() > t_end:
+            break
+        v_spec = vmap[vtype]
+        # Items with their bin index, sorted by weight ASC
+        items_with_idx = [(idx, ilookup[bins[idx].items[0][0]]) for idx in indices]
+        items_with_idx.sort(key=lambda x: x[1]['weight'])
+
+        lo, hi = 0, len(items_with_idx) - 1
+        while lo < hi:
+            if time.monotonic() > t_end:
+                break
+            ia, item_a = items_with_idx[lo]  # lightest unprocessed
+            ib, item_b = items_with_idx[hi]  # heaviest unprocessed
+            if ia in consumed or ib in consumed:
+                if ia in consumed: lo += 1
+                if ib in consumed: hi -= 1
+                continue
+            nb = Bin3D(v_spec['type'], v_spec['W'], v_spec['D'], v_spec['H'],
+                       v_spec['max_weight'], v_spec['max_value'],
+                       v_spec['gravity'], v_spec['cost'])
+            # Heavy first — usually larger, deserves bottom-left placement
+            if not nb.try_add(item_b):
+                # Heavy doesn't even fit alone (shouldn't happen since it was a single bin)
+                hi -= 1
+                continue
+            if not nb.try_add(item_a):
+                # Pair doesn't fit — even the lightest can't go with this heavy.
+                # Heavy stays alone (no benefit pairing it with anything heavier).
+                hi -= 1
+                continue
+            # Optionally try to fit a 3rd item from the still-unprocessed range.
+            # Walk from lo+1 upward looking for a tiny item that still fits.
+            mid = lo + 1
+            added_third = False
+            while mid < hi:
+                im, item_m = items_with_idx[mid]
+                if im in consumed:
+                    mid += 1
+                    continue
+                if nb.try_add(item_m):
+                    consumed.add(im)
+                    added_third = True
+                    break
+                mid += 1
+            new_bins.append(nb)
+            consumed.add(ia)
+            consumed.add(ib)
+            lo += 1
+            hi -= 1
+
+    if not consumed:
+        return bins, False
+
+    result = [b.copy() for i, b in enumerate(bins) if i not in consumed]
+    result.extend(new_bins)
+    if _cost(result) < _cost(bins) - 1e-9:
+        return result, True
+    return bins, False
+
+
+def op_bin_split(bins, ilookup, vehicles, rng, t_end):
+    """
+    Try to SPLIT an expensive multi-item bin into 2 cheaper bins.
+    For each candidate bin B (cost c_B, vehicle V_B), find a pair (V', V'')
+    of vehicles with c_V' + c_V'' < c_B such that B's items can be split
+    between fresh bins of types V' and V''. Sort items by weight desc and
+    greedy-assign to whichever bin has more remaining weight capacity (or
+    fits dimensionally).
+
+    Feasibility: every placement uses Bin3D.try_add() — gravity, weight,
+    value, dim, overlap all checked. Strict-improvement only.
+    """
+    n = len(bins)
+    if n < 1:
+        return bins, False
+    # Sort vehicles by cost ascending for cheapest-first iteration
+    veh_sorted = sorted(vehicles, key=lambda v: v['cost'])
+
+    expensive = sorted(range(n), key=lambda i: -bins[i].cost)
+    for ai in expensive[:min(8, n)]:
+        if time.monotonic() > t_end:
+            break
+        b = bins[ai]
+        if len(b.items) < 2:
+            continue
+        items = [ilookup[rec[0]] for rec in b.items]
+
+        # Search: pair of vehicle types (cheaper combined)
+        for vi, v1 in enumerate(veh_sorted):
+            if v1['cost'] >= b.cost - 1e-9:
+                break
+            for v2 in veh_sorted[vi:]:
+                if v1['cost'] + v2['cost'] >= b.cost - 1e-9:
+                    break
+                if time.monotonic() > t_end:
+                    return bins, False
+                # Try to split items between fresh v1 and v2 bins
+                # Sort items by weight desc, greedy assign
+                ordered = sorted(items, key=lambda x: -x['weight'])
+                nb1 = Bin3D(v1['type'], v1['W'], v1['D'], v1['H'],
+                            v1['max_weight'], v1['max_value'],
+                            v1['gravity'], v1['cost'])
+                nb2 = Bin3D(v2['type'], v2['W'], v2['D'], v2['H'],
+                            v2['max_weight'], v2['max_value'],
+                            v2['gravity'], v2['cost'])
+                ok = True
+                for it in ordered:
+                    # Prefer bin with more remaining weight capacity
+                    rem1 = nb1.max_weight - nb1.weight
+                    rem2 = nb2.max_weight - nb2.weight
+                    if rem1 >= rem2:
+                        if not nb1.try_add(it):
+                            if not nb2.try_add(it):
+                                ok = False
+                                break
+                    else:
+                        if not nb2.try_add(it):
+                            if not nb1.try_add(it):
+                                ok = False
+                                break
+                if not ok:
+                    continue
+                if not nb1.items or not nb2.items:
+                    # All items went into one bin — better handled by op_retype
+                    continue
+                # We have a feasible 2-way split with cheaper combined cost
+                cand = [bins[k].copy() for k in range(n) if k != ai]
+                cand.append(nb1)
+                cand.append(nb2)
+                if _cost(cand) < _cost(bins) - 1e-9:
+                    return cand, True
+                break  # next v2 won't reduce cost since v_sorted ascending
+    return bins, False
+
 
 def _can_host_all(items, v):
     tw = sum(it['weight'] for it in items)
@@ -497,90 +909,6 @@ def op_merge3(bins, ilookup, vehicles, rng, t_end):
                 return keep, True
     return bins, False
 
-def op_compact_small(bins, ilookup, vehicles, rng, t_end):
-    """
-    Compact low-cost/lightly-filled bins into fewer bins.
-    This helps datasets where many tiny cheap bins can be merged profitably.
-    """
-    if len(bins) < 3:
-        return bins, False
-    ranked = sorted(
-        range(len(bins)),
-        key=lambda i: (bins[i].cost, len(bins[i].items)),
-    )
-    for a in ranked[:min(10, len(ranked))]:
-        if time.monotonic() > t_end:
-            break
-        others = [i for i in ranked if i != a][:min(18, len(ranked)-1)]
-        if len(others) < 2:
-            continue
-        pairs = []
-        for i in range(len(others)):
-            for j in range(i + 1, len(others)):
-                pairs.append((others[i], others[j]))
-        rng.shuffle(pairs)
-        for b, c in pairs[:10]:
-            if time.monotonic() > t_end:
-                return bins, False
-            old_cost = bins[a].cost + bins[b].cost + bins[c].cost
-            ids = []
-            for idx in (a, b, c):
-                ids.extend(rec[0] for rec in bins[idx].items)
-            uniq_ids = list(dict.fromkeys(ids))
-            items = [ilookup[iid] for iid in uniq_ids]
-            packed = _pack_in_one_or_two_bins(items, vehicles, t_end)
-            if not packed:
-                continue
-            new_cost = sum(nb.cost for nb in packed)
-            if new_cost < old_cost - 1e-9:
-                keep = [bins[k].copy() for k in range(len(bins)) if k not in (a, b, c)]
-                keep.extend(packed)
-                return keep, True
-    return bins, False
-
-def op_compact4(bins, ilookup, vehicles, rng, t_end):
-    """
-    Compact 4 low-cost bins into <=2 bins when profitable.
-    """
-    if len(bins) < 4:
-        return bins, False
-    ranked = sorted(
-        range(len(bins)),
-        key=lambda i: (bins[i].cost, len(bins[i].items)),
-    )
-    anchors = ranked[:min(8, len(ranked))]
-    for a in anchors:
-        if time.monotonic() > t_end:
-            break
-        others = [i for i in ranked if i != a][:min(12, len(ranked)-1)]
-        if len(others) < 3:
-            continue
-        triplets = []
-        for i in range(len(others)):
-            for j in range(i + 1, len(others)):
-                for k in range(j + 1, len(others)):
-                    triplets.append((others[i], others[j], others[k]))
-        rng.shuffle(triplets)
-        for b, c, d in triplets[:6]:
-            if time.monotonic() > t_end:
-                return bins, False
-            idxs = (a, b, c, d)
-            old_cost = sum(bins[idx].cost for idx in idxs)
-            ids = []
-            for idx in idxs:
-                ids.extend(rec[0] for rec in bins[idx].items)
-            uniq_ids = list(dict.fromkeys(ids))
-            items = [ilookup[iid] for iid in uniq_ids]
-            packed = _pack_in_one_or_two_bins(items, vehicles, t_end)
-            if not packed:
-                continue
-            new_cost = sum(nb.cost for nb in packed)
-            if new_cost < old_cost - 1e-9:
-                keep = [bins[k].copy() for k in range(len(bins)) if k not in idxs]
-                keep.extend(packed)
-                return keep, True
-    return bins, False
-
 def op_retype(bins, ilookup, vehicles, rng, t_end):
     if not bins:
         return bins, False
@@ -606,150 +934,140 @@ def op_retype(bins, ilookup, vehicles, rng, t_end):
             break
     return bins, False
 
-def _pack_with_cost_cap(items, vehicles, max_cost, t_end, max_bins=3):
-    """
-    Pack all items into a set of bins selected from `vehicles`, with total
-    opening cost strictly below max_cost.
-    """
-    work = []
-    total = 0.0
-    for it in sorted(items, key=lambda x: (-x['vol'], -x['maxdim'])):
-        if time.monotonic() > t_end:
-            return None
-        placed = False
-        for b in sorted(work, key=lambda bb: bb.rem_vol()):
-            if b.try_add(it):
-                placed = True
-                break
-        if placed:
-            continue
-
-        opened = False
-        for v in vehicles:
-            if total + v['cost'] > max_cost + 1e-9:
-                continue
-            if len(work) >= max_bins:
-                continue
-            if it['weight'] > v['max_weight'] + 1e-9:
-                continue
-            if it['value'] > v['max_value'] + 1e-9:
-                continue
-            if not item_fits(it, v):
-                continue
-            nb = Bin3D(v['type'], v['W'], v['D'], v['H'],
-                       v['max_weight'], v['max_value'], v['gravity'], v['cost'])
-            if nb.try_add(it):
-                work.append(nb)
-                total += v['cost']
-                opened = True
-                break
-        if not opened:
-            return None
-
-    if total < max_cost - 1e-9:
-        return work
-    return None
-
-def op_split_retype(bins, ilookup, vehicles, rng, t_end):
-    """
-    Replace one expensive bin with multiple cheaper bins when total cost drops.
-    Useful on datasets where large bins are not cost-efficient.
-    """
-    if not bins:
-        return bins, False
-    order = list(range(len(bins)))
-    rng.shuffle(order)
-    order.sort(key=lambda i: bins[i].cost, reverse=True)
-    n_try = 6 if len(bins) < 20 else 10
-    for bi in order[:min(n_try, len(order))]:
-        if time.monotonic() > t_end:
-            break
-        src = bins[bi]
-        cheaper = [v for v in vehicles if v['cost'] < src.cost - 1e-9]
-        if not cheaper:
-            continue
-        cheaper = sorted(cheaper, key=lambda v: (v['cost'], -v['vol']))
-        its = [ilookup[r[0]] for r in src.items]
-        packed = _pack_with_cost_cap(its, cheaper, src.cost - 1e-9, t_end, max_bins=3)
-        if packed is None:
-            continue
-        cand = [bins[k].copy() for k in range(len(bins)) if k != bi]
-        cand.extend(packed)
-        if _cost(cand) < _cost(bins) - 1e-9:
-            return cand, True
-    return bins, False
-
 def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
+    """
+    Adaptive Large Neighborhood Search (ALNS).
+    op_elim is always tried first (deterministic improvement, cheap).
+    The remaining operators are selected by roulette wheel based on recent success.
+    Weights are periodically decayed toward uniform to keep exploration alive.
+    """
     if rng is None: rng=random.Random()
     cur=list(bins); stag=0
     destroy_rate=0.33
     elim_failures=0
-    while time.monotonic()<t_end:
-        imp=False
-        new,ok=op_elim(cur,ilookup,vehicles,t_end)
+
+    # Mutable state for closures
+    state = {'destroy_rate': destroy_rate}
+
+    sec_ops = [
+        ('RELOC',  lambda c: op_relocate(c, ilookup, vehicles, rng, t_end)),
+        ('RETYPE', lambda c: op_retype(c,   ilookup, vehicles, rng, t_end)),
+        ('SHAKE',  lambda c: op_shake(c,    ilookup, vehicles, rng, t_end)),
+        ('MERGE3', lambda c: op_merge3(c,   ilookup, vehicles, rng, t_end)),
+        ('EJECT',  lambda c: op_eject(c,    ilookup, vehicles, rng, t_end,
+                                       destroy_rate=state['destroy_rate'])),
+        ('SWAP',   lambda c: op_swap_pair(c, ilookup, vehicles, rng, t_end)),
+        ('CONS2',  lambda c: op_consolidate_pair(c, ilookup, vehicles, rng, t_end)),
+        ('RUIN',   lambda c: op_ruin_recreate(c, ilookup, vehicles, rng, t_end,
+                                              ruin_frac=min(0.45, max(0.20,
+                                                  state['destroy_rate'])))),
+        ('WPAIR',  lambda c: op_weight_pair_repack(c, ilookup, vehicles, rng, t_end)),
+        ('SPLIT',  lambda c: op_bin_split(c, ilookup, vehicles, rng, t_end)),
+        ('REDIS',  lambda c: op_redistribute_then_retype(c, ilookup, vehicles, rng, t_end)),
+    ]
+    decay_factor = {'RELOC': 0.88, 'RETYPE': 0.92, 'SHAKE': 0.92,
+                    'MERGE3': 0.90, 'EJECT': 0.95, 'SWAP': 0.93,
+                    'CONS2': 0.92, 'RUIN': 0.95,
+                    'WPAIR': 0.92, 'SPLIT': 0.93, 'REDIS': 0.94}
+    n_ops    = len(sec_ops)
+    weights  = [1.0] * n_ops
+    reaction = 0.40   # how aggressively we update weights on success
+    decay    = 0.96   # periodic pull toward uniform for exploration
+    iter_n   = 0
+    # VNS-style escalation: when stuck, fire progressively stronger kicks
+    # (Variable Neighborhood Search) before giving up on this LNS call.
+    vns_levels = [0.30, 0.45, 0.60]  # ruin fractions for escalation
+    vns_idx = 0
+    best_cost_seen = _cost(cur)
+    best_cur = [b.copy() for b in cur]
+
+    while time.monotonic() < t_end:
+        # Always try elim first.
+        new, ok = op_elim(cur, ilookup, vehicles, t_end)
         if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.85)
-            elim_failures=0
+            cur = new; stag = 0
+            state['destroy_rate'] = max(0.25, state['destroy_rate'] * 0.85)
+            elim_failures = 0
             if pool: pool.add_solution(cur)
-            if verbose: print(f'    [ELIM]  bins={len(cur):3d}  cost={_cost(cur):.2f}')
+            cc = _cost(cur)
+            if cc < best_cost_seen - 1e-9:
+                best_cost_seen = cc
+                best_cur = [b.copy() for b in cur]
+                vns_idx = 0  # reset escalation on real improvement
+            if verbose: print(f'    [ELIM]  bins={len(cur):3d}  cost={cc:.2f}')
             continue
         else:
             elim_failures += 1
             if elim_failures >= 5:
-                destroy_rate=min(0.85, destroy_rate + 0.25)
+                state['destroy_rate'] = min(0.85, state['destroy_rate'] + 0.25)
                 elim_failures = 0
-        new,ok=op_retype(cur,ilookup,vehicles,rng,t_end)
+
+        # Roulette-wheel pick over secondary operators.
+        total = sum(weights)
+        if total <= 1e-9:
+            weights = [1.0] * n_ops; total = float(n_ops)
+        threshold = rng.random() * total
+        acc = 0.0
+        choice = n_ops - 1
+        for i, w in enumerate(weights):
+            acc += w
+            if threshold <= acc:
+                choice = i
+                break
+        op_name, op_fn = sec_ops[choice]
+        new, ok = op_fn(cur)
         if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.92)
+            cur = new; stag = 0
+            state['destroy_rate'] = max(0.25,
+                state['destroy_rate'] * decay_factor[op_name])
             if pool: pool.add_solution(cur)
-            if verbose: print(f'    [RETYPE] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        new,ok=op_split_retype(cur,ilookup,vehicles,rng,t_end)
-        if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.90)
-            if pool: pool.add_solution(cur)
-            if verbose: print(f'    [SPLIT] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        new,ok=op_shake(cur,ilookup,vehicles,rng,t_end)
-        if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.92)
-            if pool: pool.add_solution(cur)
-            if verbose: print(f'    [SHAKE] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        new,ok=op_merge3(cur,ilookup,vehicles,rng,t_end)
-        if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.90)
-            if pool: pool.add_solution(cur)
-            if verbose: print(f'    [MERGE3] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        new,ok=op_compact_small(cur,ilookup,vehicles,rng,t_end)
-        if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.90)
-            if pool: pool.add_solution(cur)
-            if verbose: print(f'    [COMPACT] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        new,ok=op_compact4(cur,ilookup,vehicles,rng,t_end)
-        if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.90)
-            if pool: pool.add_solution(cur)
-            if verbose: print(f'    [COMPACT4] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        new,ok=op_eject(cur,ilookup,vehicles,rng,t_end,destroy_rate=destroy_rate)
-        if ok:
-            cur=new; stag=0; imp=True
-            destroy_rate=max(0.25, destroy_rate*0.95)
-            if pool: pool.add_solution(cur)
-            if verbose: print(f'    [EJECT] bins={len(cur):3d}  cost={_cost(cur):.2f}')
-        if not imp:
-            stag+=1
-            if stag>=40: break
-    return cur
+            cc = _cost(cur)
+            if cc < best_cost_seen - 1e-9:
+                best_cost_seen = cc
+                best_cur = [b.copy() for b in cur]
+                vns_idx = 0
+            if verbose: print(f'    [{op_name}] bins={len(cur):3d}  cost={cc:.2f}')
+            # Reward: bias toward this operator.
+            weights[choice] = weights[choice] * (1 - reaction) + reaction * 6.0
+        else:
+            # Mild penalty so a failing operator fades.
+            weights[choice] = max(0.1, weights[choice] * 0.97)
+            stag += 1
+            # VNS escalation at stagnation milestones
+            if stag in (60, 90) and vns_idx < len(vns_levels):
+                if time.monotonic() > t_end:
+                    break
+                kicked, kok = op_ruin_recreate(
+                    best_cur, ilookup, vehicles, rng, t_end,
+                    ruin_frac=vns_levels[vns_idx]
+                )
+                vns_idx += 1
+                if kok:
+                    cur = kicked
+                    if pool: pool.add_solution(cur)
+                    if verbose:
+                        print(f'    [VNS-K{vns_idx}] cost={_cost(cur):.2f}')
+                    cc = _cost(cur)
+                    if cc < best_cost_seen - 1e-9:
+                        best_cost_seen = cc
+                        best_cur = [b.copy() for b in cur]
+                        vns_idx = 0
+            if stag >= 150: break
+
+        iter_n += 1
+        if iter_n % 30 == 0:
+            avg = sum(weights) / n_ops
+            for i in range(n_ops):
+                weights[i] = weights[i] * decay + avg * (1.0 - decay)
+
+    # Always return the best seen, not just the final state.
+    return best_cur if _cost(best_cur) < _cost(cur) - 1e-9 else cur
 
 def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
     """
     Deterministic intensification pass for the incumbent.
     Applies only strict-improvement moves, so objective cannot worsen.
+    Includes op_relocate and op_swap_pair for final polish.
     """
     cur = [b.copy() for b in bins]
     rng = random.Random(987654321)
@@ -757,11 +1075,14 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
         imp = False
         for op in (
             lambda x: op_elim(x, ilookup, vehicles, t_end),
+            lambda x: op_redistribute_then_retype(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_consolidate_pair(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_weight_pair_repack(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_relocate(x, ilookup, vehicles, rng, t_end),
             lambda x: op_retype(x, ilookup, vehicles, rng, t_end),
-            lambda x: op_split_retype(x, ilookup, vehicles, rng, t_end),
             lambda x: op_merge3(x, ilookup, vehicles, rng, t_end),
-            lambda x: op_compact_small(x, ilookup, vehicles, rng, t_end),
-            lambda x: op_compact4(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_bin_split(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_swap_pair(x, ilookup, vehicles, rng, t_end),
             lambda x: op_eject(x, ilookup, vehicles, rng, t_end, destroy_rate=0.45),
         ):
             new, ok = op(cur)
@@ -775,25 +1096,336 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
                 break
         if not imp:
             break
-    
-    # Extra polishing: try elim + retype again (often they find more improvements on refined solutions)
-    for _ in range(2):
-        if time.monotonic() >= t_end:
-            break
-        new, ok = op_elim(cur, ilookup, vehicles, t_end)
-        if ok and _cost(new) < _cost(cur) - 1e-9:
-            cur = new
-            if pool:
-                pool.add_solution(cur)
-        if time.monotonic() >= t_end:
-            break
-        new, ok = op_retype(cur, ilookup, vehicles, rng, t_end)
-        if ok and _cost(new) < _cost(cur) - 1e-9:
-            cur = new
-            if pool:
-                pool.add_solution(cur)
-    
     return cur
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  WEIGHT-AWARE / VOLUME-AWARE CONSTRUCTION
+#  Targets weight-binding (e.g. DatasetI) and volume-binding instances directly
+#  by aggressively filling the most resource-efficient vehicle to its cap.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _retype_partial_bin(b, items_in_b, by_abs, t_end):
+    """Try to downsize bin b to cheaper vehicle that still fits items.
+    Returns new bin (or original if no downsize found)."""
+    tw = sum(it['weight'] for it in items_in_b)
+    tv = sum(it['value']  for it in items_in_b)
+    for v in by_abs:
+        if time.monotonic() > t_end: break
+        if v['cost'] >= b.cost - 1e-9: break
+        if v['max_weight'] < tw - 1e-9: continue
+        if v['max_value']  < tv - 1e-9: continue
+        # Heuristic: also need volume to fit at least
+        if v['vol'] < sum(it['vol'] for it in items_in_b) - 1e-9: continue
+        nb = Bin3D(v['type'], v['W'], v['D'], v['H'],
+                   v['max_weight'], v['max_value'],
+                   v['gravity'], v['cost'])
+        ordered = sorted(items_in_b, key=lambda x: -x['vol'])
+        ok = True
+        for it in ordered:
+            if not nb.try_add(it):
+                ok = False; break
+        if ok:
+            return nb
+    return b
+
+
+def _lpt_pack(items_sorted, vehicles, n_primary, primary, by_abs, t_end,
+              squeeze=True):
+    """LPT-style packing into n_primary primary bins + leftover tail bin.
+    Heaviest items first, each goes to the bin with currently lowest weight
+    that can fit it. Items that can't fit any primary bin go to leftover.
+
+    With squeeze=True, after main LPT pass, try unplaced items in vol-asc
+    order against ALL bins (small items can fill EP gaps left by big items).
+
+    Leftovers placed in cheapest viable single tail vehicle.
+    Returns list of bins (post-retype) or None on infeasibility."""
+    if n_primary < 1:
+        return None
+    bins = [Bin3D(primary['type'], primary['W'], primary['D'], primary['H'],
+                  primary['max_weight'], primary['max_value'],
+                  primary['gravity'], primary['cost'])
+            for _ in range(n_primary)]
+    unplaced = []
+    for k, it in enumerate(items_sorted):
+        if time.monotonic() > t_end:
+            unplaced.extend(items_sorted[k:])
+            break
+        # Try lightest bin first (LPT scheduling rule)
+        order = sorted(range(len(bins)), key=lambda i: bins[i].weight)
+        placed = False
+        for j in order:
+            if bins[j].try_add(it):
+                placed = True; break
+        if not placed:
+            unplaced.append(it)
+
+    # Squeeze pass: small leftovers may fit in EP gaps of existing bins.
+    # Sort unplaced by volume asc — smallest items first.
+    if squeeze and unplaced:
+        unplaced.sort(key=lambda x: x['vol'])
+        still_unplaced = []
+        for it in unplaced:
+            if time.monotonic() > t_end:
+                still_unplaced.append(it); continue
+            placed = False
+            # Try bin with most volume slack first (best chance for small)
+            order = sorted(range(len(bins)),
+                           key=lambda i: -(bins[i].W * bins[i].D * bins[i].H
+                                            - bins[i].vol_used))
+            for j in order:
+                if bins[j].try_add(it):
+                    placed = True; break
+            if not placed:
+                still_unplaced.append(it)
+        unplaced = still_unplaced
+
+    bins = [b for b in bins if b.items]
+
+    # Place leftovers in single cheapest viable tail vehicle
+    if unplaced:
+        unp_w = sum(it['weight'] for it in unplaced)
+        unp_v = sum(it['value'] for it in unplaced)
+        unp_vol = sum(it['vol'] for it in unplaced)
+        tail_done = False
+        for v in by_abs:
+            if time.monotonic() > t_end: break
+            if v['max_weight'] < unp_w - 1e-9: continue
+            if v['max_value'] < unp_v - 1e-9: continue
+            if v['vol'] < unp_vol - 1e-9: continue
+            # Try multiple item orderings for tail packing
+            for order_key in (
+                lambda x: -x['vol'],
+                lambda x: -x['maxdim'],
+                lambda x: -x['base_area'],
+            ):
+                if time.monotonic() > t_end: break
+                nb = Bin3D(v['type'], v['W'], v['D'], v['H'],
+                           v['max_weight'], v['max_value'],
+                           v['gravity'], v['cost'])
+                ordered = sorted(unplaced, key=order_key)
+                ok = True
+                for it in ordered:
+                    if not nb.try_add(it):
+                        ok = False; break
+                if ok:
+                    bins.append(nb)
+                    unplaced = []
+                    tail_done = True
+                    break
+            if tail_done: break
+        # Fallback: place each leftover individually
+        if not tail_done:
+            for it in unplaced:
+                placed = False
+                for b in bins:
+                    if b.try_add(it):
+                        placed = True; break
+                if not placed:
+                    nb = open_bin(it, by_abs)
+                    if nb: bins.append(nb)
+                    else: return None
+
+    # Retype each bin to cheapest viable vehicle
+    item_by_id = {it['id']: it for it in items_sorted}
+    for i in range(len(bins)):
+        if time.monotonic() > t_end: break
+        b = bins[i]
+        items_in_b = [item_by_id[rec[0]] for rec in b.items]
+        bins[i] = _retype_partial_bin(b, items_in_b, by_abs, t_end)
+    return bins
+
+
+def construct_weight_packed(items_dicts, vehicles, t_end):
+    """
+    Weight-FFD construction with LPT distribution.
+
+    Strategy:
+      1. primary = cheapest cost-per-weight vehicle.
+      2. n_min = ceil(total_weight / primary.max_weight) — minimum primary bins
+         needed by weight alone.
+      3. Try (n_min - 1, n_min, n_min + 1) configurations:
+           * n_min - 1 + tail: leftovers go to a small cheap vehicle
+             (often the LP-optimal split, e.g. 21 V2 + 1 V7).
+           * n_min: balanced LPT, may need a tail too.
+           * n_min + 1: more headroom, fewer leftovers but more cost.
+      4. Each configuration: LPT-pack heaviest-first into bin with min weight.
+      5. Retype each bin to cheapest viable vehicle.
+      6. Return cheapest of the configs.
+    """
+    if not items_dicts:
+        return []
+    by_cpw = sorted(vehicles, key=lambda v: v['cost'] / max(v['max_weight'], 1.0))
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+    primary = by_cpw[0]
+    total_w = sum(it['weight'] for it in items_dicts)
+    n_min = max(1, int(math.ceil(total_w / max(primary['max_weight'], 1.0))))
+
+    # Try multiple item orderings — LPT phase order matters for 3D density
+    orderings = [
+        ('weight-desc', sorted(items_dicts, key=lambda x: -x['weight'])),
+        ('vol-desc',    sorted(items_dicts, key=lambda x: (-x['vol'], -x['maxdim']))),
+        ('maxdim-desc', sorted(items_dicts, key=lambda x: (-x['maxdim'], -x['vol']))),
+    ]
+
+    candidates = []
+    for n in (n_min - 1, n_min, n_min + 1):
+        if time.monotonic() > t_end: break
+        if n < 1: continue
+        for tag, items_sorted in orderings:
+            if time.monotonic() > t_end: break
+            try:
+                bins = _lpt_pack(items_sorted, vehicles, n, primary, by_abs, t_end)
+            except Exception:
+                bins = None
+            if bins:
+                candidates.append(bins)
+
+    if not candidates:
+        return None
+    return min(candidates, key=_cost)
+
+
+def construct_volume_packed(items_dicts, vehicles, t_end):
+    """
+    Greedy volume-FFD: target volume-binding instances.
+    Picks vehicle with min(cost / vol), packs items vol-desc to volume cap.
+    """
+    if not items_dicts:
+        return []
+    by_cpv = sorted(vehicles, key=lambda v: v['cost'] / max(v['vol'], 1.0))
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+
+    primary = by_cpv[0]
+    items_sorted = sorted(items_dicts, key=lambda x: (-x['vol'], -x['maxdim']))
+
+    bins = []
+    unplaced = list(items_sorted)
+    while unplaced:
+        if time.monotonic() > t_end:
+            return None
+        nb = Bin3D(primary['type'], primary['W'], primary['D'], primary['H'],
+                   primary['max_weight'], primary['max_value'],
+                   primary['gravity'], primary['cost'])
+        new_unplaced = []
+        for it in unplaced:
+            if not nb.try_add(it):
+                new_unplaced.append(it)
+        if not nb.items:
+            it = unplaced[0]
+            nb_fb = open_bin(it, by_abs)
+            if nb_fb is None:
+                return None
+            bins.append(nb_fb)
+            unplaced = unplaced[1:]
+            continue
+        bins.append(nb)
+        unplaced = new_unplaced
+
+    item_by_id = {it['id']: it for it in items_dicts}
+    for i in range(len(bins)):
+        if time.monotonic() > t_end: break
+        b = bins[i]
+        items_in_b = [item_by_id[rec[0]] for rec in b.items]
+        bins[i] = _retype_partial_bin(b, items_in_b, by_abs, t_end)
+    return bins
+
+
+def op_redistribute_then_retype(bins, ilookup, vehicles, rng, t_end):
+    """
+    Move items from a 'victim' bin into other same-vtype bins (filling them
+    toward weight cap), then retype victim to cheapest vehicle that still
+    fits its remaining items.
+
+    Targets the canonical pathology: N homogeneous bins at 80-90% weight
+    utilization, when the LP-optimal would be (N-1) at 100% + 1 small bin.
+
+    Strict-improvement only.
+    """
+    n = len(bins)
+    if n < 2:
+        return bins, False
+    by_type = {}
+    for i, b in enumerate(bins):
+        by_type.setdefault(b.vtype, []).append(i)
+    candidates = [(vt, idxs) for vt, idxs in by_type.items() if len(idxs) >= 2]
+    if not candidates:
+        return bins, False
+
+    rng.shuffle(candidates)
+    by_abs_cost = sorted(vehicles, key=lambda v: v['cost'])
+
+    for vt, idxs in candidates:
+        if time.monotonic() > t_end:
+            break
+        # Try multiple "victim" choices: the lightest 1..3 bins
+        idxs_by_w = sorted(idxs, key=lambda i: bins[i].weight)
+        n_victims_try = min(3, len(idxs_by_w) - 1)
+        for vt_pick in range(n_victims_try):
+            if time.monotonic() > t_end:
+                break
+            victim_idx = idxs_by_w[vt_pick]
+            victim = bins[victim_idx]
+            if not victim.items:
+                continue
+            other_idx_list = [i for i in idxs_by_w if i != victim_idx]
+            recv_copies = [bins[i].copy() for i in other_idx_list]
+
+            items_to_move = sorted(
+                [(rec[0], ilookup[rec[0]]) for rec in victim.items],
+                key=lambda p: -p[1]['weight']
+            )
+            moved_ids = set()
+            for iid, idict in items_to_move:
+                if time.monotonic() > t_end:
+                    break
+                # Place in receiver with most remaining weight first (best fit chance)
+                order = sorted(
+                    range(len(recv_copies)),
+                    key=lambda j: -(recv_copies[j].max_weight - recv_copies[j].weight)
+                )
+                for j in order:
+                    if recv_copies[j].try_add(idict):
+                        moved_ids.add(iid)
+                        break
+            if not moved_ids:
+                continue
+
+            remaining_items = [ilookup[rec[0]] for rec in victim.items
+                               if rec[0] not in moved_ids]
+
+            if not remaining_items:
+                # Victim fully emptied — drop it
+                cand = []
+                for k, b in enumerate(bins):
+                    if k == victim_idx:
+                        continue
+                    if k in other_idx_list:
+                        cand.append(recv_copies[other_idx_list.index(k)])
+                    else:
+                        cand.append(b.copy())
+                if _cost(cand) < _cost(bins) - 1e-9:
+                    return cand, True
+                continue
+
+            # Try retype victim to cheapest vehicle holding remaining_items
+            retyped = _retype_partial_bin(victim, remaining_items,
+                                          by_abs_cost, t_end)
+            if retyped is victim or retyped.cost >= victim.cost - 1e-9:
+                continue
+
+            cand = []
+            for k, b in enumerate(bins):
+                if k == victim_idx:
+                    cand.append(retyped)
+                elif k in other_idx_list:
+                    cand.append(recv_copies[other_idx_list.index(k)])
+                else:
+                    cand.append(b.copy())
+            if _cost(cand) < _cost(bins) - 1e-9:
+                return cand, True
+    return bins, False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -866,13 +1498,14 @@ def _build_coverage_matrix(columns, all_item_ids):
     return A, costs, item_idx
 
 
-def _filter_columns_lp(columns, all_item_ids, max_cols=700, lp_budget=8.):
+def _filter_columns_lp(columns, all_item_ids, max_cols=700, lp_budget=8.,
+                        must_keep_keys=None):
     """
-    Reduce column pool to max_cols using a two-step strategy:
-      1. LP Set-Cover relaxation (>= 1, not = 1) to identify fractionally
-         useful columns — these span the binding LP basis.
-      2. Mandatory inclusion of the cheapest column per item (ensures every
-         item remains coverable after filtering).
+    Reduce column pool to max_cols using a multi-step strategy:
+      0. Mandatory inclusion of caller-supplied "must keep" columns
+         (e.g. the incumbent's bins) — protects warm-start from being filtered out.
+      1. LP Set-Cover relaxation (>= 1) to identify fractionally useful columns.
+      2. Cheapest column per item — guarantees coverage feasibility.
       3. Fill to max_cols by cheapest cost-per-covered-item ratio.
     """
     if len(columns) <= max_cols:
@@ -882,6 +1515,13 @@ def _filter_columns_lp(columns, all_item_ids, max_cols=700, lp_budget=8.):
     A, costs, _ = _build_coverage_matrix(columns, all_item_ids)
 
     keep = set()
+
+    # Step 0: must-keep (incumbent columns) — never filter out the incumbent.
+    if must_keep_keys:
+        col_keys = [frozenset(rec[0] for rec in b.items) for b in columns]
+        for j, k in enumerate(col_keys):
+            if k in must_keep_keys:
+                keep.add(j)
 
     # Step 1: LP relaxation with INEQUALITY (set cover — always feasible)
     try:
@@ -953,6 +1593,22 @@ def _solve_cover_highspy(
         h.setOptionValue('parallel', parallel_mode)
         h.setOptionValue('time_limit', float(max(1.0, t_budget)))
         h.setOptionValue('mip_rel_gap', float(gap))
+
+        h.setOptionValue('symmetry', 'off') # NEW
+        # Correct HiGHS option name — the line above is silently ignored.
+        # The crash on DatasetG happened in HighsSymmetryDetection::run on a worker thread.
+        try:
+            h.setOptionValue('mip_detect_symmetry', False)
+        except Exception:
+            pass
+
+        # --- LIMITA I THREAD DI HIGHS ---
+        if parallel_mode == 'on':
+            h.setOptionValue('parallel', 'on')
+            h.setOptionValue('threads', 4)  # Forza HiGHS a usare max 4 thread
+        else:
+            h.setOptionValue('parallel', 'off')
+            h.setOptionValue('threads', 1)
 
         xvars = [h.addBinary(obj=float(c), name=f'x{j}') for j, c in enumerate(scaled_costs)]
 
@@ -1158,24 +1814,16 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
 
     # ── Filter to tractable size via LP ───────────────────────────────────
     lp_budget = min(8., t_budget * 0.18)
+    must_keep = set(warm_keys) if warm_keys else None
     columns   = _filter_columns_lp(columns, all_item_ids,
-                                   max_cols=max_cols, lp_budget=lp_budget)
+                                   max_cols=max_cols, lp_budget=lp_budget,
+                                   must_keep_keys=must_keep)
 
     # ── Check every item is covered by at least one column ────────────────
     A, costs, item_idx = _build_coverage_matrix(columns, all_item_ids)
     row_sums = np.array(A.sum(axis=1)).flatten()
     if row_sums.min() < 0.5:
         return None, float('inf')   # some item uncoverable in this pool
-
-    # ── Validate matrix integrity ─────────────────────────────────────────
-    if A.shape[0] == 0 or A.shape[1] == 0:
-        return None, float('inf')
-    if not np.isfinite(costs).all():
-        print(f'  [WARN] Non-finite costs detected, clamping')
-        costs = np.nan_to_num(costs, nan=1e6, posinf=1e6, neginf=1.0)
-    if A.nnz == 0:
-        print(f'  [WARN] Empty coverage matrix')
-        return None, float('inf')
 
     n_items = len(all_item_ids)
     n_cols  = len(columns)
@@ -1260,34 +1908,26 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
 
         x_main = None
         if _HAS_HIGHSPY:
-            try:
-                x_main = _solve_cover_highspy(
-                    scaled_costs, cover_rows, clique_rows_cols, main_budget, gap,
-                    warm_cols=sorted(warm_cols), parallel_mode=highs_parallel
-                )
-            except Exception as e:
-                print(f'  [HiGHS] crashed: {str(e)[:80]}; fallback to scipy')
-                x_main = None
+            x_main = _solve_cover_highspy(
+                scaled_costs, cover_rows, clique_rows_cols, main_budget, gap,
+                warm_cols=sorted(warm_cols), parallel_mode=highs_parallel
+            )
 
         if x_main is None:
-            try:
-                result = milp(
-                    scaled_costs,
-                    constraints=constraints,
-                    integrality=integrality,
-                    bounds=bounds,
-                    options={
-                        'time_limit': main_budget,
-                        'disp': False,
-                        'mip_rel_gap': gap,
-                        'presolve': True,
-                    }
-                )
-                if result.x is not None:
-                    x_main = result.x
-            except Exception as e:
-                print(f'  [MILP] error: {str(e)[:80]}')
-                x_main = None
+            result = milp(
+                scaled_costs,
+                constraints=constraints,
+                integrality=integrality,
+                bounds=bounds,
+                options={
+                    'time_limit': main_budget,
+                    'disp': False,
+                    'mip_rel_gap': gap,
+                    'presolve': True,
+                }
+            )
+            if result.x is not None:
+                x_main = result.x
 
         if x_main is not None:
             candidate_x.append(x_main)
@@ -1300,7 +1940,7 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
                 cpsat_budget,
                 gap=max(gap, 5e-5),
                 warm_cols=sorted(warm_cols),
-                n_workers=min(8, max(1, os.cpu_count() or 4)),
+                n_workers=4,
                 seed=(len(all_item_ids) * 131 + n_cols * 17 + 7),
             )
             if x_cp is not None:
@@ -1359,11 +1999,193 @@ def generate_columns_for_item(seed_item, items, vehicles, n_cols,
 
     return out
 
+
+def generate_columns_pair_seeded(items, vehicles, n_cols, rng, t_end):
+    """
+    Pair-seeded column generation.
+
+    Picks two compatible items (one large, one medium/small) and seeds them
+    into a fresh bin, then greedily fills with remaining items in random order.
+    Generates structurally diverse columns vs. single-seed: pairs that "fit
+    naturally" lead to high-density packings the LNS pool may not contain.
+    """
+    out = []
+    if len(items) < 2:
+        return out
+    sorted_items = sorted(items, key=lambda x: -x['vol'])
+    n_top = min(len(sorted_items) // 3 + 1, 30)
+    big_pool = sorted_items[:n_top]
+    rest_pool = sorted_items[n_top:] if len(sorted_items) > n_top else sorted_items
+
+    for _ in range(n_cols):
+        if time.monotonic() > t_end:
+            break
+        if not big_pool or not rest_pool:
+            break
+        big = big_pool[rng.randrange(len(big_pool))]
+        small = rest_pool[rng.randrange(len(rest_pool))]
+        if big['id'] == small['id']:
+            continue
+        for v in vehicles:
+            if time.monotonic() > t_end:
+                break
+            # Capacity precheck
+            if big['weight'] + small['weight'] > v['max_weight'] + 1e-9:
+                continue
+            if big['value'] + small['value'] > v['max_value'] + 1e-9:
+                continue
+            if big['vol'] + small['vol'] > v['vol'] + 1e-9:
+                continue
+            if not item_fits(big, v) or not item_fits(small, v):
+                continue
+            b = Bin3D(v['type'], v['W'], v['D'], v['H'],
+                      v['max_weight'], v['max_value'], v['gravity'], v['cost'])
+            if not b.try_add(big):
+                continue
+            if not b.try_add(small):
+                continue
+            # Greedy fill — large items first then random
+            placed_ids = {big['id'], small['id']}
+            remaining = [it for it in items if it['id'] not in placed_ids]
+            if rng.random() < 0.5:
+                remaining.sort(key=lambda x: -x['vol'])
+            else:
+                rng.shuffle(remaining)
+            for it in remaining:
+                if not b.cap_ok(it['weight'], it['value']):
+                    continue
+                b.try_add(it)
+            out.append(b)
+            break
+    return out
+
+def path_relinking(incumbent, pool, ilookup, vehicles, t_end, rng):
+    """
+    Path Relinking from column pool to incumbent.
+
+    For each candidate column C in the pool that is NOT in the incumbent:
+      1. Identify the items in C.
+      2. Remove those items from incumbent bins (compute "remainder bins").
+      3. Add C as a new bin.
+      4. Some incumbent bins may be empty or partially-emptied; reconstruct
+         them by repacking remaining items.
+      5. Accept if total cost strictly decreases.
+
+    This swaps high-quality alternative bins (found by independent searches)
+    into the incumbent, often unlocking improvements neither solution had alone.
+    Only accepts strict improvements — never worsens cost.
+    """
+    if not incumbent or not pool:
+        return incumbent, False
+    cols = pool.get_columns()
+    if not cols:
+        return incumbent, False
+
+    cur = [b.copy() for b in incumbent]
+    cur_keys = {frozenset(rec[0] for rec in b.items) for b in cur}
+    cur_cost = _cost(cur)
+
+    # Rank candidate columns by efficiency: low cost-per-item-covered.
+    # Skip columns already in incumbent and tiny ones (1-item columns can't
+    # beat removing-and-resplitting from incumbent).
+    candidates = []
+    for c in cols:
+        if len(c.items) < 2:
+            continue
+        key = frozenset(rec[0] for rec in c.items)
+        if key in cur_keys:
+            continue
+        eff = c.cost / max(1, len(c.items))
+        candidates.append((eff, c))
+    candidates.sort(key=lambda x: x[0])
+    candidates = [c for _, c in candidates[:80]]  # cap workload
+
+    # Build item -> set of incumbent bin indices that contain it
+    improved_any = False
+    for cand in candidates:
+        if time.monotonic() > t_end:
+            break
+
+        cand_ids = [rec[0] for rec in cand.items]
+        cand_id_set = set(cand_ids)
+
+        # Find bins touched by this candidate's items
+        item_to_bin = {}
+        for bi, b in enumerate(cur):
+            for rec in b.items:
+                if rec[0] in cand_id_set:
+                    item_to_bin[rec[0]] = bi
+        touched = sorted(set(item_to_bin.values()), reverse=True)
+        if not touched:
+            continue
+
+        # Build trial: remove cand items from touched bins (rebuild those bins)
+        trial = [b.copy() for b in cur]
+        leftover_items = []
+        new_bins_for_touched = []
+        ok = True
+        for bi in touched:
+            old_b = trial[bi]
+            keep_items = [ilookup[rec[0]] for rec in old_b.items
+                          if rec[0] not in cand_id_set]
+            if not keep_items:
+                continue  # bin is fully emptied
+            nb = Bin3D(old_b.vtype, old_b.W, old_b.D, old_b.H,
+                       old_b.max_weight, old_b.max_value, old_b.gravity, old_b.cost)
+            for it in sorted(keep_items, key=lambda x: -x['vol']):
+                if not nb.try_add(it):
+                    leftover_items.append(it)
+            new_bins_for_touched.append((bi, nb))
+        if not ok:
+            continue
+
+        # Build resulting bin list
+        result = [b.copy() for k, b in enumerate(trial) if k not in touched]
+        for _, nb in new_bins_for_touched:
+            if nb.items:
+                result.append(nb)
+        result.append(cand.copy())
+
+        # Place leftover items
+        infeasible = False
+        for it in sorted(leftover_items, key=lambda x: -x['vol']):
+            if time.monotonic() > t_end:
+                infeasible = True
+                break
+            placed = False
+            for bb in sorted(result, key=lambda x: x.rem_vol()):
+                if bb.try_add(it):
+                    placed = True
+                    break
+            if not placed:
+                nb2 = open_bin(it, vehicles)
+                if nb2 is None:
+                    infeasible = True
+                    break
+                result.append(nb2)
+        if infeasible:
+            continue
+
+        new_cost = _cost(result)
+        if new_cost < cur_cost - 1e-9:
+            cur = result
+            cur_cost = new_cost
+            cur_keys = {frozenset(rec[0] for rec in b.items) for b in cur}
+            improved_any = True
+    return cur, improved_any
+
+
 def mine_columns_from_incumbent(best_bins, ilookup, vehicle_cycle, pool, t_end, rng):
     """
     Intensification around incumbent:
     destroy a subset of bins, repack removed items, run short LNS,
     and inject resulting bins into the column pool.
+
+    Improvements vs. baseline:
+      - Wider destruction (3-8 bins, scaled by incumbent size).
+      - Probes targeted at the most expensive bins (higher leverage).
+      - Tries 2 vehicle orderings per destruction for diversity.
+      - Pool snapshot before AND after the local LNS.
     """
     if not best_bins:
         return
@@ -1371,43 +2193,73 @@ def mine_columns_from_incumbent(best_bins, ilookup, vehicle_cycle, pool, t_end, 
     if len(base) < 2:
         return
 
+    n_base = len(base)
+    # Scale destruction range to incumbent: small instances → small k, large → bigger k.
+    k_min = 3 if n_base >= 6 else 2
+    k_max = min(n_base - 1, max(k_min + 2, n_base // 6 + 4, 8))
+
+    iter_n = 0
     while time.monotonic() < t_end:
+        iter_n += 1
+
+        # Mix of random and "expensive-bin-targeted" destructions.
+        target_expensive = (iter_n % 3 == 0)
         work = [b.copy() for b in base]
-        k = min(len(work) - 1, rng.randint(2, 5))
-        if k <= 0:
-            break
+        k = rng.randint(k_min, k_max)
+
+        if target_expensive:
+            order = sorted(range(len(work)), key=lambda i: -work[i].cost)
+            top = order[: max(k * 2, 6)]
+            rng.shuffle(top)
+            chosen = sorted(top[:k], reverse=True)
+        else:
+            chosen = sorted(rng.sample(range(len(work)), k), reverse=True)
 
         removed = []
-        for idx in sorted(rng.sample(range(len(work)), k), reverse=True):
+        for idx in chosen:
             for rec in work[idx].items:
                 removed.append(ilookup[rec[0]])
             del work[idx]
 
-        vehs = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
-        ok = True
-        for it in sorted(removed, key=lambda x: -x['vol']):
+        # Try this destruction with up to 2 different vehicle orderings.
+        n_vehs_try = 2 if rng.random() < 0.6 else 1
+        veh_indices = rng.sample(range(len(vehicle_cycle)),
+                                 min(n_vehs_try, len(vehicle_cycle)))
+
+        for vi in veh_indices:
             if time.monotonic() > t_end:
                 return
-            placed = False
-            for b in sorted(work, key=lambda bb: bb.rem_vol()):
-                if b.try_add(it):
-                    placed = True
+            vehs = vehicle_cycle[vi]
+            trial = [b.copy() for b in work]
+            ok = True
+            for it in sorted(removed, key=lambda x: -x['vol']):
+                if time.monotonic() > t_end:
+                    return
+                placed = False
+                for b in sorted(trial, key=lambda bb: bb.rem_vol()):
+                    if b.try_add(it):
+                        placed = True
+                        break
+                if not placed:
+                    nb = open_bin(it, vehs)
+                    if nb:
+                        trial.append(nb)
+                        placed = True
+                if not placed:
+                    ok = False
                     break
-            if not placed:
-                nb = open_bin(it, vehs)
-                if nb:
-                    work.append(nb)
-                    placed = True
-            if not placed:
-                ok = False
-                break
 
-        if not ok:
-            continue
+            if not ok:
+                continue
 
-        local_end = min(time.monotonic() + 6.0, t_end)
-        work = lns(work, ilookup, vehs, local_end, rng, verbose=False, pool=pool)
-        pool.add_solution(work)
+            # Snapshot raw repack first — already a valid column set.
+            pool.add_solution(trial)
+
+            # Short local LNS for refinement.
+            local_end = min(time.monotonic() + 5.0, t_end)
+            trial = lns(trial, ilookup, vehs, local_end, rng,
+                        verbose=False, pool=pool)
+            pool.add_solution(trial)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1561,7 +2413,6 @@ class solver_364130(AbstractSolver):
         pool      = ColumnPool()
         best_bins = [None]
         best_cost = [float('inf')]
-        last_improve_ts = [t0]
         lock      = threading.Lock()
 
         def update_best(bins, label=''):
@@ -1570,7 +2421,6 @@ class solver_364130(AbstractSolver):
                 if c < best_cost[0] - 1e-9:
                     best_cost[0] = c
                     best_bins[0] = [b.copy() for b in bins]
-                    last_improve_ts[0] = time.monotonic()
                     log(f'    ★ NEW BEST {label}: cost={c:.2f}  bins={len(bins)}')
                     return True
             return False
@@ -1587,8 +2437,6 @@ class solver_364130(AbstractSolver):
         by_value     = build_sequence(items, 'value', random.Random(seed0 + 104))
         by_footprint = build_sequence(items, 'footprint', random.Random(seed0 + 105))
         by_densw     = build_sequence(items, 'densw', random.Random(seed0 + 106))
-        by_densv     = build_sequence(items, 'densv', random.Random(seed0 + 107))
-        by_mixed     = build_sequence(items, 'mixed', random.Random(seed0 + 108))
 
         def _worker(label, seq, bf, alpha, seed, vehs):
             rng = random.Random(seed)
@@ -1596,6 +2444,21 @@ class solver_364130(AbstractSolver):
             if unp:
                 return label, None, float('inf')
             bins = lns(bins, ilookup, vehs, t_p1, rng, verbose=False, pool=pool)
+            pool.add_solution(bins)
+            return label, bins, _cost(bins)
+
+        def _worker_resource_packed(label, mode, seed):
+            """Run weight-FFD or volume-FFD construction (no LNS — fast).
+            Adds bins to pool so MILP set-partition can pick them.
+            Direct attack on weight-binding / volume-binding pathologies."""
+            if mode == 'weight':
+                bins = construct_weight_packed(items, vehicles, t_p1)
+            elif mode == 'volume':
+                bins = construct_volume_packed(items, vehicles, t_p1)
+            else:
+                return label, None, float('inf')
+            if bins is None:
+                return label, None, float('inf')
             pool.add_solution(bins)
             return label, bins, _cost(bins)
 
@@ -1612,19 +2475,25 @@ class solver_364130(AbstractSolver):
             ('bigeff-maxd',   by_maxdim, True,  0.00, seed0 + 10, v_orders['big_eff']),
             ('fp-bal',        by_footprint, True, 0.00, seed0 + 11, v_orders['balanced']),
             ('densw-cap',     by_densw, True, 0.00, seed0 + 12, v_orders['capacity']),
-            ('densv-cost',    by_densv, True, 0.08, seed0 + 13, v_orders['cost']),
-            ('mixed-bal-bf',  by_mixed, True, 0.10, seed0 + 14, v_orders['balanced']),
-            ('rnd-ag-bf',     items,    True, 0.22, seed0 + 15, v_orders['big_eff']),
-            ('mixed-cpv',     by_mixed, False, 0.06, seed0 + 16, v_orders['cpv']),
         ]
         for j, mono in enumerate(mono_vehicle_lists):
             configs.append((f"mono-{mono[0]['type']}", by_vol, True, 0.06, seed0 + 20 + j, mono))
 
+        # Resource-packed constructions: direct attack on weight/volume-binding
+        # instances. Run in same thread pool as GRASP workers.
+        resource_configs = [
+            ('w-pack',  'weight', seed0 + 50),
+            ('v-pack',  'volume', seed0 + 51),
+        ]
+
         with ThreadPoolExecutor(max_workers=self.N_THREADS) as ex:
-            fs = {
-                ex.submit(_worker, label, seq, bf, alpha, seed, vehs): label
-                for (label, seq, bf, alpha, seed, vehs) in configs
-            }
+            # Submit resource-packed workers FIRST — they're fast (deterministic
+            # constructions, no LNS) and their bins go to the column pool.
+            fs = {}
+            for (rlabel, rmode, rseed) in resource_configs:
+                fs[ex.submit(_worker_resource_packed, rlabel, rmode, rseed)] = rlabel
+            for (label, seq, bf, alpha, seed, vehs) in configs:
+                fs[ex.submit(_worker, label, seq, bf, alpha, seed, vehs)] = label
             for f in as_completed(fs):
                 try:
                     label, bins, _ = f.result()
@@ -1651,58 +2520,16 @@ class solver_364130(AbstractSolver):
         # PHASE 2 — LNS + GRASP restarts
         # ─────────────────────────────────────────────────────────────────────
         log(f"\n  Phase 2  —  GRASP restarts + LNS  (column harvesting)")
-        small = len(items) <= 1000
-        very_large = len(items) >= 1800
-        large = len(items) >= 1400
-        p2_tail = 75.0
-        if very_large:
-            p2_tail = 110.0
-        elif large:
-            p2_tail = 90.0
-        t_p2      = tend - p2_tail
+        t_p2      = tend - 75.0
         restarts  = [0]
-        phase2_stop = threading.Event()
-        p2_start = time.monotonic()
-
-        # Stop restart-heavy exploration when Phase 2 is clearly saturated.
-        # This avoids burning minutes on unproductive GRASP loops and shifts
-        # budget to exact/finishing phases.
-        stagnation_limit = 35.0 if small else (60.0 if very_large else 42.0)
-        full_pool_trigger = int(ColumnPool._MAX_POOL * 0.95) if very_large else int(ColumnPool._MAX_POOL * 0.97)
-        min_restarts_for_stop = max(60, len(items) // 7) if very_large else max(80, len(items) // 5)
-
-        def _phase2_should_stop():
-            now = time.monotonic()
-            if now >= t_p2:
-                return True
-            elapsed = now - p2_start
-            p2_budget = max(1.0, t_p2 - p2_start)
-            if elapsed < min(45.0, 0.25 * p2_budget):
-                return False
-            with lock:
-                no_imp = now - last_improve_ts[0]
-                n_rst = restarts[0]
-            if pool.size() >= full_pool_trigger and no_imp >= stagnation_limit:
-                return True
-            if n_rst >= min_restarts_for_stop and no_imp >= stagnation_limit * 1.6:
-                return True
-            return False
 
         def _deep_lns():
             with lock:
                 snap = [b.copy() for b in best_bins[0]]
             rng = random.Random(seed0 + 42)
-            while time.monotonic() < t_p2 and not phase2_stop.is_set():
-                chunk_end = min(time.monotonic() + 24.0, t_p2)
-                improved = lns(
-                    snap, ilookup, vehicles, chunk_end, rng,
-                    verbose=self.VERBOSE, pool=pool
-                )
-                update_best(improved, 'lns-deep')
-                snap = improved
-                if _phase2_should_stop():
-                    phase2_stop.set()
-                    break
+            improved = lns(snap, ilookup, vehicles, t_p2, rng,
+                           verbose=self.VERBOSE, pool=pool)
+            update_best(improved, 'lns-deep')
 
         def _restart_worker(seed_base):
             rng = random.Random(seed_base)
@@ -1710,8 +2537,7 @@ class solver_364130(AbstractSolver):
             if self.DETERMINISTIC:
                 n_restarts = max(40, min(220, len(items) // 6))
                 for _ in range(n_restarts):
-                    if phase2_stop.is_set() or _phase2_should_stop():
-                        phase2_stop.set()
+                    if time.monotonic() >= t_p2:
                         break
                     slot = max(2.0, min(7.0, (t_p2 - time.monotonic()) / max(1, n_restarts)))
                     alpha = rng.uniform(0.05, 0.35)
@@ -1734,10 +2560,7 @@ class solver_364130(AbstractSolver):
                     update_best(bins, 'restart')
                 return
 
-            while not phase2_stop.is_set() and time.monotonic() < t_p2:
-                if _phase2_should_stop():
-                    phase2_stop.set()
-                    break
+            while time.monotonic() < t_p2:
                 alpha = rng.uniform(0.05, 0.35)
                 bf    = rng.random() < 0.5
                 vehs  = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
@@ -1776,59 +2599,55 @@ class solver_364130(AbstractSolver):
         log(f"\n  Phase 3  —  Set Partition ILP  ({int(tend - time.monotonic())} s left)")
 
         rng_cg = random.Random(seed0 + 5555)
-        t_cg_window = 22.0
-        if small:
-            t_cg_window = 30.0
-        elif very_large:
-            t_cg_window = 36.0
-        elif large:
-            t_cg_window = 28.0
-        t_cg   = min(time.monotonic() + t_cg_window, tend - 50.0)
-        n_cols_seed = 10 if small else 6
-        for i, item in enumerate(sorted(items, key=lambda x: -x['vol'])):
-            if time.monotonic() > t_cg:
+        # Pre-seed: explicit weight-FFD and volume-FFD constructions before MILP.
+        # Cheap (deterministic, single-pass), guarantees fully resource-packed
+        # columns are always available to the set-partition solver.
+        t_seed_end = min(time.monotonic() + 10.0, tend - 55.0)
+        if t_seed_end > time.monotonic() + 1.0:
+            try:
+                wb = construct_weight_packed(items, vehicles, t_seed_end)
+                if wb:
+                    pool.add_solution(wb)
+                    log(f"  Pre-seed weight-packed: {len(wb)} bins, "
+                        f"cost={_cost(wb):.2f}")
+            except Exception as e:
+                log(f"  weight-packed seed failed: {e}")
+            try:
+                vb = construct_volume_packed(items, vehicles, t_seed_end)
+                if vb:
+                    pool.add_solution(vb)
+                    log(f"  Pre-seed volume-packed: {len(vb)} bins, "
+                        f"cost={_cost(vb):.2f}")
+            except Exception as e:
+                log(f"  volume-packed seed failed: {e}")
+
+        # Split CG budget: ~70% item-centric, ~30% pair-seeded for column diversity.
+        t_cg_total = min(time.monotonic() + 22.0, tend - 50.0)
+        t_cg_pair_split = time.monotonic() + max(2.0, (t_cg_total - time.monotonic()) * 0.30)
+
+        # Pair-seeded columns first (cheap, structurally diverse)
+        for vi in range(min(3, len(vehicle_cycle))):
+            if time.monotonic() > t_cg_pair_split:
                 break
-            vehs = vehicle_cycle[i % len(vehicle_cycle)]
-            for b in generate_columns_for_item(item, items, vehs, n_cols_seed, rng_cg, t_cg):
+            n_pair = max(20, len(items) // 6)
+            for b in generate_columns_pair_seeded(
+                items, vehicle_cycle[vi], n_pair, rng_cg, t_cg_pair_split
+            ):
                 pool.add_bin(b)
 
-        if small and time.monotonic() < t_cg - 2.0:
-            for i, item in enumerate(sorted(items, key=lambda x: -x['weight'])):
-                if time.monotonic() > t_cg:
-                    break
-                vehs = vehicle_cycle[(i + 3) % len(vehicle_cycle)]
-                for b in generate_columns_for_item(item, items, vehs, 4, rng_cg, t_cg):
-                    pool.add_bin(b)
-
-        # Extra seeding for small datasets: focus on value-density and footprint
-        if small and time.monotonic() < t_cg - 1.5:
-            density_items = sorted(items, key=lambda x: -x['density_v'])[:min(8, len(items))]
-            for i, item in enumerate(density_items):
-                if time.monotonic() > t_cg:
-                    break
-                vehs = vehicle_cycle[(i + 7) % len(vehicle_cycle)]
-                for b in generate_columns_for_item(item, items, vehs, 3, rng_cg, t_cg):
-                    pool.add_bin(b)
+        # Item-centric columns on the remaining budget
+        for i, item in enumerate(sorted(items, key=lambda x: -x['vol'])):
+            if time.monotonic() > t_cg_total:
+                break
+            vehs = vehicle_cycle[i % len(vehicle_cycle)]
+            for b in generate_columns_for_item(item, items, vehs, 6, rng_cg, t_cg_total):
+                pool.add_bin(b)
 
         cols = pool.get_columns()
         log(f"  Column pool size: {len(cols)}")
 
-        milp_budget_cap = 34.0
-        milp_cols_cap = 2200
-        if small:
-            milp_budget_cap = 42.0
-            milp_cols_cap = 2800
-        elif very_large:
-            milp_budget_cap = 46.0
-            milp_cols_cap = 3000
-        elif large:
-            milp_budget_cap = 38.0
-            milp_cols_cap = 2600
-        milp_budget = min(milp_budget_cap, tend - time.monotonic() - 24.0)
-        base_cols = max(1000, len(all_ids) // 2 + 500)
-        if small:
-            base_cols = max(base_cols, len(all_ids) + 600)
-        milp_cols   = min(milp_cols_cap, base_cols)
+        milp_budget = min(34.0, tend - time.monotonic() - 24.0)
+        milp_cols   = min(2200, max(1000, len(all_ids) // 2 + 500))
         milp_improved = False
         if milp_budget > 5.0 and cols:
             log(f"  Running MILP  (budget={milp_budget:.0f}s, cols={milp_cols}) ...")
@@ -1848,8 +2667,7 @@ class solver_364130(AbstractSolver):
             log('  MILP skipped (budget too small or no columns)')
 
         # Extra intensification: mine columns near incumbent, then rerun MILP.
-        t_mine_cap = 28.0 if not very_large else 40.0
-        t_mine = min(time.monotonic() + t_mine_cap, tend - 22.0)
+        t_mine = min(time.monotonic() + 28.0, tend - 22.0)
         if t_mine > time.monotonic() + 2.0 and best_bins[0]:
             with lock:
                 incumbent = [b.copy() for b in best_bins[0]]
@@ -1858,12 +2676,9 @@ class solver_364130(AbstractSolver):
             )
             cols2 = pool.get_columns()
             log(f"  Column pool after intensification: {len(cols2)}")
-            milp_budget2 = min(
-                16.0 if (small or very_large) else 12.0,
-                tend - time.monotonic() - 10.0,
-            )
-            milp_cols2 = min(3200 if (small or very_large) else 2400, milp_cols + 400)
-            run_milp2 = small or milp_improved or (len(cols2) >= len(cols) + 120)
+            milp_budget2 = min(12.0, tend - time.monotonic() - 10.0)
+            milp_cols2 = min(2400, milp_cols + 400)
+            run_milp2 = milp_improved or (len(cols2) >= len(cols) + 120)
             if milp_budget2 > 4.0 and cols2 and run_milp2:
                 log(f"  Running MILP-2 (budget={milp_budget2:.0f}s, cols={milp_cols2}) ...")
                 with lock:
@@ -1880,21 +2695,24 @@ class solver_364130(AbstractSolver):
                 log("  MILP-2 skipped (not promising after MILP-1)")
 
         # ─────────────────────────────────────────────────────────────────────
-        # PHASE 3b — Extra polish for small datasets
-        # ─────────────────────────────────────────────────────────────────────
-        if small and time.monotonic() < tend - 20.0:
-            log(f"  Phase 3b — small-dataset extra polish ({int(tend - time.monotonic())} s left)")
-            with lock:
-                snap = [b.copy() for b in best_bins[0]]
-            polish_end = min(time.monotonic() + 12.0, tend - 18.0)
-            snap = post_optimize_bins(snap, ilookup, vehicles, polish_end, pool=pool)
-            update_best(snap, 'phase3b-polish')
-
-        # ─────────────────────────────────────────────────────────────────────
         # PHASE 4 — Final polish
         # ─────────────────────────────────────────────────────────────────────
         remaining = int(tend - time.monotonic())
         log(f"\n  Phase 4  —  final LNS polish  ({remaining} s left)")
+
+        # Path Relinking: substitute alternative columns from the pool into
+        # the incumbent. Often unlocks improvements neither GRASP+LNS nor
+        # the MILP found on their own.
+        if remaining > 25 and best_bins[0]:
+            with lock:
+                snap_pr = [b.copy() for b in best_bins[0]]
+            pr_end = min(time.monotonic() + 8.0, tend - 18.0)
+            pr_result, pr_imp = path_relinking(
+                snap_pr, pool, ilookup, vehicles, pr_end,
+                random.Random(seed0 + 31313)
+            )
+            if pr_imp:
+                update_best(pr_result, 'path-relink')
 
         with lock:
             snap = [b.copy() for b in best_bins[0]]
@@ -1966,6 +2784,19 @@ class solver_364130(AbstractSolver):
                         update_best(cand, f'lateR-{seed % 1000}')
                 seed += 97
 
+        # Second Path Relinking round — pool has grown a lot in late bursts.
+        rem = tend - time.monotonic()
+        if rem > 9.0 and best_bins[0]:
+            with lock:
+                snap_pr2 = [b.copy() for b in best_bins[0]]
+            pr2_end = min(time.monotonic() + 4.0, tend - 5.0)
+            pr2_result, pr2_imp = path_relinking(
+                snap_pr2, pool, ilookup, vehicles, pr2_end,
+                random.Random(seed0 + 42424)
+            )
+            if pr2_imp:
+                update_best(pr2_result, 'path-relink-2')
+
         # Deterministic incumbent polishing (cannot worsen objective).
         rem = tend - time.monotonic()
         if rem > 6.0:
@@ -1991,18 +2822,6 @@ class solver_364130(AbstractSolver):
                 )
                 if selected3 is not None:
                     update_best(selected3, 'milp-final')
-
-        # Ultra-final aggressive eject in last 1.5 seconds
-        rem = tend - time.monotonic()
-        if rem > 1.0:
-            with lock:
-                snap = [b.copy() for b in best_bins[0]]
-            eject_end = min(tend - 0.3, time.monotonic() + min(1.0, rem - 0.3))
-            rng_final = random.Random(seed0 + 88888)
-            for _ in range(3):
-                if time.monotonic() > eject_end: break
-                snap, ok = op_eject_expensive(snap, ilookup, vehicles, rng_final, eject_end, destroy_rate=0.45)
-                if ok: update_best(snap, 'final-eject')
 
         # ─────────────────────────────────────────────────────────────────────
         # Build output with final safety repair
