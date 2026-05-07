@@ -3,7 +3,7 @@ import pandas as pd
 from instances import Instance
 
 if __name__ == '__main__':
-    dataset_name = 'DatasetA'
+    dataset_name = 'Dataset9'
     solver_name = 'solver_364130'
     inst = Instance(dataset_name)
 
@@ -81,15 +81,15 @@ if __name__ == '__main__':
             box = {
                 "id": item_id,
                 "x1": x, "y1": y, "z1": z,
-                "x2": x + w, "y2": y + d, "z2": z + h,
+                "x2": x + d, "y2": y + w, "z2": z + h,
                 "base_area": w * d
             }
 
             # -------------------------
             # Bounds
             # -------------------------
-            if box["x2"] > vehicle["width"] or \
-            box["y2"] > vehicle["depth"] or \
+            if box["x2"] > vehicle["depth"] or \
+            box["y2"] > vehicle["width"] or \
             box["z2"] > vehicle["height"]:
                 print(f"\nVehicle {vidx} ({vehicle_type}):")
                 print(f"OUT OF BOUNDS: {item_id}")

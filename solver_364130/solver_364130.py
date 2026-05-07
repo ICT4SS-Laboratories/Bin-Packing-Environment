@@ -36,11 +36,10 @@ except Exception:
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  ROTATION TABLE
-#  Derived by reading results_checker.py → get_dims():
-#    rotations[orient] = (w_out, d_out, h_out)
-#    w_out → x-axis  (checked against vehicle["width"])
-#    d_out → y-axis  (checked against vehicle["depth"])
-#    h_out → z-axis  (checked against vehicle["height"])
+#  rotate(w,d,h,rot) → (iw, id_, ih)
+#  Solver internal axes: x bounded by W=vehicle.width, y by D=vehicle.depth.
+#  CSV output swaps: x_origin=solver_y, y_origin=solver_x so that the checker
+#  constraint (x+d ≤ vehicle.depth, y+w ≤ vehicle.width) is satisfied.
 # ══════════════════════════════════════════════════════════════════════════════
 
 _ROT_IDX = [
@@ -78,12 +77,22 @@ class Bin3D:
       · EPs start at {(0,0,0)}.
       · Placing at (x,y,z)+(iw,id_,ih) adds  (x+iw,y,z), (x,y+id_,z), (x,y,z+ih).
       · EPs tried sorted (z asc, x asc, y asc) → bottom-up = gravity-safe.
+
+    Performance:
+      · Pure-Python overlap loop with short-circuit return — faster than numpy
+        for the typical bin-packing pattern where most candidate EPs hit an
+        early overlap and a vectorised scan can't beat short-circuit.
+      · Gravity check uses an index by quantised z-level, so the support scan
+        only visits boxes whose top z equals the new bottom z.
+      · find_ep early-breaks on z (EPs are sorted by z asc).
     """
     _MAX_EPS = 700
+    _Z_QUANT = 1_000_000
 
     __slots__ = ('vtype','W','D','H','max_weight','max_value','gravity','cost',
                  'items','_boxes','weight','value','vol_used',
-                 '_eps','_eps_set','_dirty')
+                 '_eps','_eps_set','_dirty',
+                 '_tops_by_z')
 
     def __init__(self, vtype, W, D, H, mw, mv, grav, cost):
         self.vtype = vtype
@@ -93,11 +102,16 @@ class Bin3D:
         self.items = []; self._boxes = []
         self.weight = self.value = self.vol_used = 0.0
         self._eps = [(0.,0.,0.)]; self._eps_set = {(0.,0.,0.)}; self._dirty = True
+        self._tops_by_z = {}
 
     # ── capacity ─────────────────────────────────────────────────────────────
     def cap_ok(self, w, v):
         return (w + self.weight <= self.max_weight + 1e-9 and
                 v + self.value  <= self.max_value  + 1e-9)
+
+    @staticmethod
+    def _zk(z):
+        return int(round(z * Bin3D._Z_QUANT))
 
     # ── geometry ──────────────────────────────────────────────────────────────
     def _overlaps(self, x, y, z, iw, id_, ih):
@@ -110,13 +124,21 @@ class Bin3D:
     def _grav_ok(self, x, y, z, iw, id_, ih):
         if self.gravity < 1e-9 or z < 1e-9: return True
         need = iw * id_ * self.gravity / 100.
-        sup  = 0.; x2,y2 = x+iw, y+id_
-        for (bx1,by1,bz1,bx2,by2,bz2) in self._boxes:
-            if abs(bz2-z) < 1e-9:
-                ox = min(x2,bx2)-max(x,bx1); oy = min(y2,by2)-max(y,by1)
-                if ox>1e-12 and oy>1e-12:
-                    sup += ox*oy
-                    if sup >= need-1e-9: return True
+        x2,y2 = x+iw, y+id_
+        # Only boxes whose top is exactly at z can support us.
+        idxs = self._tops_by_z.get(self._zk(z))
+        if not idxs:
+            return False
+        sup = 0.0
+        boxes = self._boxes
+        for k in idxs:
+            (bx1,by1,bz1,bx2,by2,bz2) = boxes[k]
+            ox = min(x2,bx2)-max(x,bx1)
+            if ox <= 1e-12: continue
+            oy = min(y2,by2)-max(y,by1)
+            if oy <= 1e-12: continue
+            sup += ox*oy
+            if sup >= need-1e-9: return True
         return False
 
     def _seps(self):
@@ -127,8 +149,13 @@ class Bin3D:
     # ── placement ────────────────────────────────────────────────────────────
     def find_ep(self, iw, id_, ih, weight, value):
         if not self.cap_ok(weight, value): return None
+        Hcap = self.H + 1e-9
+        Wcap = self.W + 1e-9
+        Dcap = self.D + 1e-9
         for (ex,ey,ez) in self._seps():
-            if ex+iw>self.W+1e-9 or ey+id_>self.D+1e-9 or ez+ih>self.H+1e-9: continue
+            # EPs are sorted by z asc — once z+ih over the box, no later EP fits.
+            if ez+ih > Hcap: break
+            if ex+iw > Wcap or ey+id_ > Dcap: continue
             if self._overlaps(ex,ey,ez,iw,id_,ih): continue
             if not self._grav_ok(ex,ey,ez,iw,id_,ih): continue
             return ex,ey,ez
@@ -136,8 +163,16 @@ class Bin3D:
 
     def place(self, iid, x, y, z, iw, id_, ih, rot, wt, vl):
         self.items.append((iid,x,y,z,iw,id_,ih,rot))
+        idx = len(self._boxes)
         self._boxes.append((x,y,z, x+iw,y+id_,z+ih))
         self.weight+=wt; self.value+=vl; self.vol_used+=iw*id_*ih
+        # Index this box by its top-z for O(1) gravity lookups.
+        zt = self._zk(z + ih)
+        bucket = self._tops_by_z.get(zt)
+        if bucket is None:
+            self._tops_by_z[zt] = [idx]
+        else:
+            bucket.append(idx)
         # Six-EP variant: original three axis-aligned EPs plus three diagonal
         # corner EPs (Crainic et al. 2008 full variant). Catches placements
         # at the corners between two stacked surfaces that the 3-EP pruning
@@ -185,6 +220,7 @@ class Bin3D:
         b.items=list(self.items); b._boxes=list(self._boxes)
         b.weight=self.weight; b.value=self.value; b.vol_used=self.vol_used
         b._eps=list(self._eps); b._eps_set=set(self._eps_set); b._dirty=self._dirty
+        b._tops_by_z = {k: list(v) for k, v in self._tops_by_z.items()}
         return b
 
 
@@ -290,8 +326,10 @@ class ColumnPool:
         self._cols  = []          # list of Bin3D
         self._idx   = {}          # key=frozenset(item_ids) -> index in _cols
 
-    # Hard cap: once we have many columns, only add if they look promising
-    _MAX_POOL = 7000
+    # Hard cap: once we have many columns, only add if they look promising.
+    # Pool is filtered down to MILP cap before solving, so a richer pool only
+    # costs memory + LP-filter time, never MILP solve time directly.
+    _MAX_POOL = 10000
 
     def add_bin(self, b: Bin3D):
         key = frozenset(r[0] for r in b.items)
@@ -1044,7 +1082,7 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
     iter_n   = 0
     # VNS-style escalation: when stuck, fire progressively stronger kicks
     # (Variable Neighborhood Search) before giving up on this LNS call.
-    vns_levels = [0.30, 0.45, 0.60]  # ruin fractions for escalation
+    vns_levels = [0.30, 0.45, 0.60]
     vns_idx = 0
     best_cost_seen = _cost(cur)
     best_cur = [b.copy() for b in cur]
@@ -2131,6 +2169,81 @@ def generate_columns_for_item(seed_item, items, vehicles, n_cols,
     return out
 
 
+def generate_columns_cost_targeted(incumbent, ilookup, vehicles, rng, t_end,
+                                    top_k=8, n_orderings=4):
+    """
+    Cost-targeted column generation.
+
+    Looks at the most expensive bins of the incumbent. For each one, tries to
+    repack its item set into a CHEAPER vehicle by sweeping multiple item
+    orderings. Any feasible result whose cost is strictly cheaper than the
+    source bin enters the column pool — these are direct "drop-in cheaper"
+    replacements that the MILP can pick to lower the partition cost.
+
+    Returns list of Bin3D columns (may be empty if no cheaper packing exists).
+    """
+    out = []
+    if not incumbent:
+        return out
+    # Sort vehicles by cost ascending so we try cheapest first
+    veh_sorted = sorted(vehicles, key=lambda v: v['cost'])
+    # Pick the most expensive bins as targets
+    expensive_bins = sorted(incumbent, key=lambda b: -b.cost)[:min(top_k, len(incumbent))]
+
+    for src_bin in expensive_bins:
+        if time.monotonic() > t_end:
+            break
+        if not src_bin.items:
+            continue
+        items = [ilookup[rec[0]] for rec in src_bin.items]
+        tw = sum(it['weight'] for it in items)
+        tv = sum(it['value'] for it in items)
+        tvol = sum(it['vol'] for it in items)
+        # Multiple item orderings — different orderings yield different packings.
+        orderings = [
+            sorted(items, key=lambda x: -x['vol']),
+            sorted(items, key=lambda x: -x['maxdim']),
+            sorted(items, key=lambda x: -x['weight']),
+            sorted(items, key=lambda x: (-x['base_area'], -x['vol'])),
+        ]
+        if n_orderings > len(orderings):
+            extra = list(items)
+            rng.shuffle(extra)
+            orderings.append(extra)
+
+        # Try each cheaper vehicle until we find a feasible packing.
+        for v in veh_sorted:
+            if time.monotonic() > t_end:
+                break
+            if v['cost'] >= src_bin.cost - 1e-9:
+                break  # vehicles are sorted; no more cheaper ones
+            if v['max_weight'] + 1e-9 < tw: continue
+            if v['max_value']  + 1e-9 < tv: continue
+            if v['vol']        + 1e-9 < tvol: continue
+            if not all(item_fits(it, v) for it in items): continue
+            for seq in orderings[:n_orderings]:
+                if time.monotonic() > t_end:
+                    break
+                nb = Bin3D(v['type'], v['W'], v['D'], v['H'],
+                           v['max_weight'], v['max_value'],
+                           v['gravity'], v['cost'])
+                ok = True
+                for it in seq:
+                    if not nb.try_add(it):
+                        ok = False
+                        break
+                if ok:
+                    out.append(nb)
+                    # Already cheaper than source — no need to try more vehicles
+                    # for this bin (cheaper vehicles for the same item set rarely
+                    # exist if this one fits).
+                    break
+            else:
+                continue
+            break
+    return out
+
+
 def generate_columns_pair_seeded(items, vehicles, n_cols, rng, t_end):
     """
     Pair-seeded column generation.
@@ -2229,7 +2342,7 @@ def path_relinking(incumbent, pool, ilookup, vehicles, t_end, rng):
         eff = c.cost / max(1, len(c.items))
         candidates.append((eff, c))
     candidates.sort(key=lambda x: x[0])
-    candidates = [c for _, c in candidates[:80]]  # cap workload
+    candidates = [c for _, c in candidates[:150]]  # cap workload
 
     # Build item -> set of incumbent bin indices that contain it
     improved_any = False
@@ -2807,11 +2920,26 @@ class solver_364130(AbstractSolver):
             for b in generate_columns_for_item(item, items, vehs, 6, rng_cg, t_cg_total):
                 pool.add_bin(b)
 
+        # Cost-targeted CG: try repacking the most expensive incumbent bins into
+        # cheaper vehicles and feed any wins to the pool. These are direct cost
+        # reductions the MILP can exploit.
+        t_ct_end = min(time.monotonic() + 4.0, tend - 48.0)
+        if t_ct_end > time.monotonic() + 0.5 and best_bins[0]:
+            with lock:
+                snap_ct = [b.copy() for b in best_bins[0]]
+            ct_cols = generate_columns_cost_targeted(
+                snap_ct, ilookup, vehicles_all, rng_cg, t_ct_end
+            )
+            for b in ct_cols:
+                pool.add_bin(b)
+            if ct_cols:
+                log(f"  Cost-targeted CG: {len(ct_cols)} cheaper-replacement columns")
+
         cols = pool.get_columns()
         log(f"  Column pool size: {len(cols)}")
 
         milp_budget = min(34.0, tend - time.monotonic() - 24.0)
-        milp_cols   = min(3000, max(1200, len(all_ids) // 2 + 800))
+        milp_cols   = min(3500, max(1200, len(all_ids) // 2 + 1000))
         milp_improved = False
         if milp_budget > 5.0 and cols:
             log(f"  Running MILP  (budget={milp_budget:.0f}s, cols={milp_cols}) ...")
@@ -2831,7 +2959,7 @@ class solver_364130(AbstractSolver):
             log('  MILP skipped (budget too small or no columns)')
 
         # Extra intensification: mine columns near incumbent, then rerun MILP.
-        t_mine = min(time.monotonic() + 28.0, tend - 22.0)
+        t_mine = min(time.monotonic() + 32.0, tend - 18.0)
         if t_mine > time.monotonic() + 2.0 and best_bins[0]:
             with lock:
                 incumbent = [b.copy() for b in best_bins[0]]
@@ -2841,7 +2969,7 @@ class solver_364130(AbstractSolver):
             cols2 = pool.get_columns()
             log(f"  Column pool after intensification: {len(cols2)}")
             milp_budget2 = min(12.0, tend - time.monotonic() - 10.0)
-            milp_cols2 = min(3200, milp_cols + 500)
+            milp_cols2 = min(4000, milp_cols + 600)
             run_milp2 = milp_improved or (len(cols2) >= len(cols) + 120)
             if milp_budget2 > 4.0 and cols2 and run_milp2:
                 log(f"  Running MILP-2 (budget={milp_budget2:.0f}s, cols={milp_cols2}) ...")
@@ -2974,15 +3102,29 @@ class solver_364130(AbstractSolver):
             polished = post_optimize_bins(snap, ilookup, v_orders['cost'], polish_end, pool=pool)
             update_best(polished, 'post-opt')
 
-        # Last exact re-optimization over full column pool — given a longer
-        # budget and larger column cap to fully exploit the pool. Reaches
-        # combinations that the time-constrained MILP-1/MILP-2 missed.
+        # Last cost-targeted CG pass on the freshly polished incumbent, then
+        # final exact re-optimization over the full column pool.
+        rem = tend - time.monotonic()
+        if rem > 4.0 and best_bins[0]:
+            with lock:
+                snap_ct2 = [b.copy() for b in best_bins[0]]
+            ct_end_late = min(time.monotonic() + 2.0, tend - 2.0)
+            ct_cols2 = generate_columns_cost_targeted(
+                snap_ct2, ilookup, vehicles_all,
+                random.Random(seed0 + 8888), ct_end_late,
+                top_k=10, n_orderings=3,
+            )
+            for b in ct_cols2:
+                pool.add_bin(b)
+            if ct_cols2:
+                log(f"  Late cost-targeted CG: {len(ct_cols2)} cheaper-replacement columns")
+
         rem = tend - time.monotonic()
         if rem > 2.5:
             cols3 = pool.get_columns()
             if cols3:
-                budget3 = min(10.0, rem - 0.8)
-                cols_cap3 = min(3500, max(1500, len(all_ids) + 700))
+                budget3 = min(13.0, rem - 0.8)
+                cols_cap3 = min(4500, max(1500, len(all_ids) + 1000))
                 with lock:
                     warm_keys3 = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
                 selected3, milp_cost3 = solve_set_partition(
@@ -3021,8 +3163,8 @@ class solver_364130(AbstractSolver):
                     'type_vehicle': b.vtype,
                     'idx_vehicle': idx_v,
                     'id_item': iid,
-                    'x_origin': round(x, 9),
-                    'y_origin': round(y, 9),
+                    'x_origin': round(y, 9),
+                    'y_origin': round(x, 9),
                     'z_origin': round(z, 9),
                     'orient': int(orient),
                 })
@@ -3043,8 +3185,8 @@ class solver_364130(AbstractSolver):
                         'type_vehicle': nb.vtype,
                         'idx_vehicle': idx_v,
                         'id_item': iid2,
-                        'x_origin': round(x, 9),
-                        'y_origin': round(y, 9),
+                        'x_origin': round(y, 9),
+                        'y_origin': round(x, 9),
                         'z_origin': round(z, 9),
                         'orient': int(orient),
                     })
