@@ -3123,7 +3123,9 @@ class solver_364130(AbstractSolver):
         if rem > 2.5:
             cols3 = pool.get_columns()
             if cols3:
-                budget3 = min(13.0, rem - 0.8)
+                # Budget shaved 1s vs original (was rem-0.8) so there is a
+                # meaningful tail window for the post-MILP polish below.
+                budget3 = min(12.0, rem - 1.8)
                 cols_cap3 = min(4500, max(1500, len(all_ids) + 1000))
                 with lock:
                     warm_keys3 = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
@@ -3134,6 +3136,24 @@ class solver_364130(AbstractSolver):
                 )
                 if selected3 is not None:
                     update_best(selected3, 'milp-final')
+
+        # Post-MILP polish: deterministic intensification on the MILP result.
+        # MILP picks the optimal column SUBSET from the pool but cannot
+        # rearrange items inside a bin, downsize a single bin's vehicle, or
+        # find late merges between adjacent bins.  post_optimize_bins is
+        # strict-improvement only, so it can NEVER worsen any dataset; it
+        # simply fills the gap between MILP's column selection and the true
+        # local-optimum partition.
+        rem = tend - time.monotonic()
+        if rem > 0.6 and best_bins[0]:
+            with lock:
+                final_snap = [b.copy() for b in best_bins[0]]
+            polish_end = tend - 0.2
+            if polish_end > time.monotonic() + 0.3:
+                polished_final = post_optimize_bins(
+                    final_snap, ilookup, vehicles, polish_end, pool=None
+                )
+                update_best(polished_final, 'post-milp-polish')
 
         # ─────────────────────────────────────────────────────────────────────
         # Build output with final safety repair
