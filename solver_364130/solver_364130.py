@@ -57,6 +57,20 @@ def rotate(w, d, h, rot):
     return s[t[0]], s[t[1]], s[t[2]]
 
 
+# ── Floating-point safety margins ──────────────────────────────────────────────
+# The official checker uses strict, ZERO-tolerance comparisons (overlap: a<b;
+# gravity: support<required). With non-integer dimensions, touching faces and
+# stacks accumulate ~1e-12..1e-9 binary-float error that the checker then flags
+# as spurious overlaps / gravity shortfalls. solve() sets these per instance:
+#   · non-integer dims  → small positive margins (pack with a hair of clearance)
+#   · integer dims       → 0.0 (exact arithmetic, behaviour identical to before)
+# _SAFE must stay BELOW the checker's 1e-6 gravity z-window (so a stacked box
+# placed _SAFE above its support is still counted as supported) and ABOVE the
+# worst observed float noise (~2e-9). 1e-7 satisfies both.
+_SAFE = 0.0        # placement separation margin
+_SAFE_GRAV = 0.0   # gravity support safety margin (area units)
+
+
 def unique_rots(w, d, h, allowed):
     seen, out = set(), []
     for r in allowed:
@@ -115,30 +129,46 @@ class Bin3D:
 
     # ── geometry ──────────────────────────────────────────────────────────────
     def _overlaps(self, x, y, z, iw, id_, ih):
+        s = _SAFE  # require >= s clearance so touching faces survive the checker
         x2,y2,z2 = x+iw, y+id_, z+ih
         for (bx1,by1,bz1,bx2,by2,bz2) in self._boxes:
-            if x<bx2 and x2>bx1 and y<by2 and y2>by1 and z<bz2 and z2>bz1:
+            if x<bx2+s and x2>bx1-s and y<by2+s and y2>by1-s and z<bz2+s and z2>bz1-s:
                 return True
         return False
 
     def _grav_ok(self, x, y, z, iw, id_, ih):
         if self.gravity < 1e-9 or z < 1e-9: return True
-        need = iw * id_ * self.gravity / 100.
+        s = _SAFE
+        # Match the official checker EXACTLY: required = base_area*(gravity/100).
+        # (Multiply-first would differ by one ULP and accept boxes it rejects.)
+        need = (iw * id_) * (self.gravity / 100.0) + _SAFE_GRAV
         x2,y2 = x+iw, y+id_
-        # Only boxes whose top is exactly at z can support us.
-        idxs = self._tops_by_z.get(self._zk(z))
+        boxes = self._boxes
+        # We place a stacked box exactly s above its support, so its supporters'
+        # tops sit at z-s. Look there (s=0 ⇒ classic "top exactly at z").
+        idxs = self._tops_by_z.get(self._zk(z - s)) if s > 0.0 \
+               else self._tops_by_z.get(self._zk(z))
         if not idxs:
             return False
         sup = 0.0
-        boxes = self._boxes
+        thresh = need if s > 0.0 else need - 1e-9
         for k in idxs:
             (bx1,by1,bz1,bx2,by2,bz2) = boxes[k]
+            # NB: 100%-gravity stacking is NOT robustly checker-feasible under
+            # binary float (a box's own computed width can fall short by ½ULP),
+            # so we deliberately require the FULL summed support to reach
+            # need = base*(grav/100) + _SAFE_GRAV. For grav=100 that exceeds the
+            # max achievable support → such items can only sit on the floor
+            # (gravity-exempt); for grav<100 the slack lets them stack safely.
+            # An earlier "accept single full cover" shortcut let the solver chase
+            # 100%-gravity stacks the output repair then had to explode wholesale
+            # (e.g. DatasetO blew up 35k→153k) — never reinstate it.
             ox = min(x2,bx2)-max(x,bx1)
             if ox <= 1e-12: continue
             oy = min(y2,by2)-max(y,by1)
             if oy <= 1e-12: continue
             sup += ox*oy
-            if sup >= need-1e-9: return True
+            if sup >= thresh: return True
         return False
 
     def _seps(self):
@@ -149,9 +179,9 @@ class Bin3D:
     # ── placement ────────────────────────────────────────────────────────────
     def find_ep(self, iw, id_, ih, weight, value):
         if not self.cap_ok(weight, value): return None
-        Hcap = self.H + 1e-9
-        Wcap = self.W + 1e-9
-        Dcap = self.D + 1e-9
+        Hcap = self.H - _SAFE + 1e-9
+        Wcap = self.W - _SAFE + 1e-9
+        Dcap = self.D - _SAFE + 1e-9
         for (ex,ey,ez) in self._seps():
             # EPs are sorted by z asc — once z+ih over the box, no later EP fits.
             if ez+ih > Hcap: break
@@ -177,12 +207,13 @@ class Bin3D:
         # corner EPs (Crainic et al. 2008 full variant). Catches placements
         # at the corners between two stacked surfaces that the 3-EP pruning
         # would miss.
-        for ep in ((x+iw, y,     z),
-                   (x,     y+id_, z),
-                   (x,     y,     z+ih),
-                   (x+iw, y+id_, z),
-                   (x+iw, y,     z+ih),
-                   (x,     y+id_, z+ih)):
+        s = _SAFE  # offset child EPs by the clearance so the next box lands s away
+        for ep in ((x+iw+s, y,       z),
+                   (x,       y+id_+s, z),
+                   (x,       y,       z+ih+s),
+                   (x+iw+s, y+id_+s, z),
+                   (x+iw+s, y,       z+ih+s),
+                   (x,       y+id_+s, z+ih+s)):
             if ep[0]<self.W-1e-9 and ep[1]<self.D-1e-9 and ep[2]<self.H-1e-9 and ep not in self._eps_set:
                 self._eps.append(ep); self._eps_set.add(ep); self._dirty=True
         if len(self._eps)>self._MAX_EPS:
@@ -374,6 +405,232 @@ class ColumnPool:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _cost(bins): return sum(b.cost for b in bins)
+
+
+# ── Checker-exact feasibility & output repair (float robustness) ───────────────
+# The official checker recomputes box extents as origin+dim and compares with
+# strict, zero-tolerance arithmetic. With non-integer dims, a box's own width
+# (origin+dim)-origin can be off by ±½ULP, so a stacked 100%-gravity box can
+# read as "support < required" by machine epsilon. We therefore (a) let the
+# solver stack on a single fully-covering supporter, and (b) at output snap each
+# box's coordinate to a sub-ULP value where the checker's arithmetic rounds
+# favourably. These run in INTERNAL coords, where the checker's geometry is the
+# same box (axes are merely renamed by the x/y output swap).
+
+def _checker_box_ok(boxes, i, grav, keep, dims):
+    """LITERAL replica of the official checker's bounds + overlap + gravity test
+    for box i, computed in the SAME coordinate frame the checker uses, so it can
+    never disagree by a rounding artefact. boxes[i] = [iid,ix,iy,z,iw,id_,ih,rot]
+    in internal coords; the CSV writes x_origin=iy, y_origin=ix, and the checker
+    derives box.x2 = x_origin + d (d=id_), box.y2 = y_origin + w (w=iw).
+    dims = (W,D,H) = vehicle (width, depth, height)."""
+    a = boxes[i]
+    iw, id_, ih = a[4], a[5], a[6]
+    # checker coordinate frame
+    x1, y1, z1 = a[2], a[1], a[3]
+    x2, y2, z2 = a[2] + id_, a[1] + iw, a[3] + ih
+    W, D, H = dims
+    # checker bounds: x2 > depth, y2 > width, z2 > height
+    if x2 > D or y2 > W or z2 > H or x1 < 0 or y1 < 0 or z1 < 0:
+        return False
+    for j, c in enumerate(boxes):
+        if j == i or not keep[j]:
+            continue
+        cx1, cy1, cz1 = c[2], c[1], c[3]
+        cx2, cy2, cz2 = c[2] + c[5], c[1] + c[4], c[3] + c[6]
+        if (max(x1, cx1) < min(x2, cx2) and
+                max(y1, cy1) < min(y2, cy2) and
+                max(z1, cz1) < min(z2, cz2)):
+            return False
+    if grav >= 1e-9 and z1 != 0:
+        need = (iw * id_) * (grav / 100.0)   # exactly as the official checker
+        sup = 0.0
+        for j, c in enumerate(boxes):
+            if j == i or not keep[j]:
+                continue
+            if abs((c[3] + c[6]) - z1) < 1e-6:
+                dx = min(x2, c[2] + c[5]) - max(x1, c[2])
+                if dx <= 0:
+                    continue
+                dy = min(y2, c[1] + c[4]) - max(y1, c[1])
+                if dy <= 0:
+                    continue
+                sup += dx * dy
+        if sup < need:
+            return False
+    return True
+
+
+def _repair_bin_for_checker(b, vehicles, ilookup):
+    """Return a list of output bins (vtype, [records]) for Bin3D b that the
+    official checker accepts exactly. Records are (iid,x,y,z,iw,id_,ih,rot) in
+    internal coords. Boxes that cannot be made checker-feasible in place are
+    split off to their own floor bins (always feasible)."""
+    boxes = [list(r) for r in b.items]
+    n = len(boxes)
+    if n == 0:
+        return []
+    grav = b.gravity
+    dims = (b.W, b.D, b.H)
+    keep = [True] * n
+    if all(_checker_box_ok(boxes, i, grav, keep, dims) for i in range(n)):
+        return [(b.vtype, [tuple(r) for r in boxes])]
+
+    # Snap shared coordinates so (origin+dim)-origin >= dim for every box that
+    # shares that coordinate. Boxes that share an edge are nudged together, so
+    # vertical columns and corner stacks keep their support relationships.
+    from collections import defaultdict
+
+    def ulp_grid(v, steps=28):
+        out = [v]; up = v; dn = v
+        for _ in range(steps):
+            up = math.nextafter(up, math.inf); out.append(up)
+            dn = math.nextafter(dn, -math.inf); out.append(dn)
+        return out
+
+    def ext_ok(v, ext):
+        # the checker's computed extent (origin+dim)-origin must be at least the
+        # nominal dim, else support/overlap can read short by machine epsilon.
+        return ((v + ext) - v) >= ext
+
+    if grav >= 1e-9:
+        xg = defaultdict(list); yg = defaultdict(list)
+        for i in range(n):
+            xg[boxes[i][1]].append(i)
+            yg[boxes[i][2]].append(i)
+        for xval, idxs in xg.items():
+            exts = [boxes[i][4] for i in idxs]
+            if all(ext_ok(xval, e) for e in exts):
+                continue
+            for cand in ulp_grid(xval):
+                if cand < 0:
+                    continue
+                if all(ext_ok(cand, e) for e in exts):
+                    for i in idxs:
+                        boxes[i][1] = cand
+                    break
+        for yval, idxs in yg.items():
+            exts = [boxes[i][5] for i in idxs]
+            if all(ext_ok(yval, e) for e in exts):
+                continue
+            for cand in ulp_grid(yval):
+                if cand < 0:
+                    continue
+                if all(ext_ok(cand, e) for e in exts):
+                    for i in idxs:
+                        boxes[i][2] = cand
+                    break
+
+    # Iteratively drop any box that still fails (removing a supporter may break
+    # the box above it, so repeat until the kept set is fully feasible).
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            if keep[i] and not _checker_box_ok(boxes, i, grav, keep, dims):
+                keep[i] = False
+                changed = True
+
+    out = []
+    main = [tuple(boxes[i]) for i in range(n) if keep[i]]
+    if main:
+        out.append((b.vtype, main))
+    for i in range(n):
+        if keep[i]:
+            continue
+        nb = open_bin(ilookup[boxes[i][0]], vehicles)
+        if nb is not None:
+            out.append((nb.vtype, [tuple(r) for r in nb.items]))
+        else:
+            out.append((b.vtype, [tuple(boxes[i])]))
+    return out
+
+
+def _enforce_checker_feasible(rows, ilookup, vehicles, veh_by_type):
+    """Final safety net. Replays the FULLY ASSEMBLED output through a literal
+    copy of the official checker (bounds + overlap + gravity, in checker coords)
+    and splits any box it would reject into its own floor bin. Independent of the
+    per-bin repair, so it cannot miss anything — the written CSV is guaranteed
+    feasible. Returns (new_rows, n_split)."""
+    from collections import defaultdict
+    bins = defaultdict(list)
+    order = []
+    for r in rows:
+        if r['idx_vehicle'] not in bins:
+            order.append(r['idx_vehicle'])
+        bins[r['idx_vehicle']].append(r)
+
+    out_rows = []
+    next_idx = 0
+    exploded = []
+    for vidx in order:
+        brows = bins[vidx]
+        v = veh_by_type[brows[0]['type_vehicle']]
+        W, D, H, grav = v['W'], v['D'], v['H'], v['gravity']
+        bx = []
+        for r in brows:
+            it = ilookup[r['id_item']]
+            iw, id_, ih = rotate(it['w'], it['d'], it['h'], int(r['orient']))
+            xo, yo, zo = r['x_origin'], r['y_origin'], r['z_origin']
+            bx.append((r, xo, yo, zo, xo + id_, yo + iw, zo + ih, iw, id_))
+        keep = [True] * len(bx)
+
+        def ok(i):
+            (_, x1, y1, z1, x2, y2, z2, iw, id_) = bx[i]
+            if x2 > D or y2 > W or z2 > H or x1 < 0 or y1 < 0 or z1 < 0:
+                return False
+            for j, c in enumerate(bx):
+                if j == i or not keep[j]:
+                    continue
+                if (max(x1, c[1]) < min(x2, c[4]) and
+                        max(y1, c[2]) < min(y2, c[5]) and
+                        max(z1, c[3]) < min(z2, c[6])):
+                    return False
+            if grav >= 1e-9 and z1 != 0:
+                need = (iw * id_) * (grav / 100.0)   # exactly as official checker
+                sup = 0.0
+                for j, c in enumerate(bx):
+                    if j == i or not keep[j]:
+                        continue
+                    if abs(c[6] - z1) < 1e-6:
+                        dx = min(x2, c[4]) - max(x1, c[1])
+                        if dx <= 0:
+                            continue
+                        dy = min(y2, c[5]) - max(y1, c[2])
+                        if dy <= 0:
+                            continue
+                        sup += dx * dy
+                if sup < need:
+                    return False
+            return True
+
+        changed = True
+        while changed:
+            changed = False
+            for i in range(len(bx)):
+                if keep[i] and not ok(i):
+                    keep[i] = False
+                    changed = True
+        kept_any = False
+        for i in range(len(bx)):
+            if keep[i]:
+                r = dict(bx[i][0]); r['idx_vehicle'] = next_idx
+                out_rows.append(r); kept_any = True
+            else:
+                exploded.append(bx[i][0]['id_item'])
+        if kept_any:
+            next_idx += 1
+
+    for iid in exploded:
+        nb = open_bin(ilookup[iid], vehicles)
+        if nb is None:
+            continue
+        for (iid2, x, y, z, iw, id_, ih, orient) in nb.items:
+            out_rows.append({'type_vehicle': nb.vtype, 'idx_vehicle': next_idx,
+                             'id_item': iid2, 'x_origin': y, 'y_origin': x,
+                             'z_origin': z, 'orient': int(orient)})
+        next_idx += 1
+    return out_rows, len(exploded)
 
 def _repack(to_place, existing, vehicles, t_end):
     """Try to fit *to_place* into *existing* (already copied). Returns (bins, success)."""
@@ -1434,6 +1691,207 @@ def construct_volume_packed(items_dicts, vehicles, t_end):
     return bins
 
 
+def _active_resources(items_dicts, vehicles):
+    """Which additive resources have a finite cap AND non-zero demand → may bind.
+
+    Purely instance-driven (no dataset-specific assumptions): a resource is
+    'active' only if some vehicle actually caps it and the items demand it.
+    This is what lets the vector constructor degrade gracefully — e.g. if
+    maxValue is infinite on every vehicle, 'value' is simply never active.
+    """
+    tot = {
+        'weight': sum(it['weight'] for it in items_dicts),
+        'value':  sum(it['value']  for it in items_dicts),
+        'vol':    sum(it['vol']    for it in items_dicts),
+    }
+    res = []
+    if tot['weight'] > 0 and any(v['max_weight'] < 1e17 for v in vehicles):
+        res.append('weight')
+    if tot['value'] > 0 and any(v['max_value'] < 1e17 for v in vehicles):
+        res.append('value')
+    if tot['vol'] > 0:
+        res.append('vol')
+    return res, tot
+
+
+def construct_vector_packed(items_dicts, vehicles, t_end):
+    """
+    Generic multi-resource ('vector') FFD construction.
+
+    Fills the gap left by construct_weight_packed / construct_volume_packed:
+    when more than one additive resource (weight / value / volume) binds — or
+    when *value* alone binds — neither single-resource builder fills bins well.
+    This builder balances all *active* resources at once, so it adapts to the
+    instance instead of being tuned to it:
+      · only weight binds  → behaves like weight-FFD
+      · only volume binds  → behaves like volume-FFD
+      · value cap finite   → value enters the balance
+      · value cap infinite → value term vanishes (nothing to overfit)
+
+    Like the other constructors it tries a few item orderings, then retypes
+    each bin down to its cheapest viable vehicle, and returns the cheapest
+    full cover (or None).
+    """
+    if not items_dicts or not vehicles:
+        return None
+    res, totals = _active_resources(items_dicts, vehicles)
+    if not res:
+        return None
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+
+    def cap_of(v, r):
+        return {'weight': v['max_weight'], 'value': v['max_value'], 'vol': v['vol']}[r]
+
+    # Generic primary pick: vehicle minimising estimated total cost, where the
+    # estimate is cost × (bins needed for the tightest active resource). With
+    # no hand-tuned weighting this naturally selects whatever vehicle is most
+    # cost-efficient on the resource that actually binds *this* instance.
+    def est_cost(v):
+        need = 1
+        for r in res:
+            cap = cap_of(v, r)
+            if cap <= 1e-9:
+                return float('inf')
+            need = max(need, int(math.ceil(totals[r] / cap)))
+        return need * v['cost']
+    primary = min(vehicles, key=est_cost)
+    if est_cost(primary) == float('inf'):
+        return None
+
+    def demand(it):
+        return {'weight': it['weight'], 'value': it['value'], 'vol': it['vol']}
+
+    p_cap = {r: cap_of(primary, r) for r in res}
+
+    def press(it):
+        d = demand(it)
+        return max((d[r] / p_cap[r]) if p_cap[r] > 1e-9 else 0.0 for r in res)
+
+    orderings = [
+        sorted(items_dicts, key=lambda it: (-press(it), -it['vol'])),
+        sorted(items_dicts, key=lambda it: (-it['weight'] - it['value'], -it['vol'])),
+        sorted(items_dicts, key=lambda it: (-it['vol'], -it['maxdim'])),
+    ]
+
+    def pack_one(items_sorted):
+        bins = []      # Bin3D list
+        caps = []      # per-bin {r: cap}
+        load = []      # per-bin {r: cumulative demand}
+        for it in items_sorted:
+            if time.monotonic() > t_end:
+                return None
+            d = demand(it)
+            # Balanced best-fit: among bins that still fit it on every active
+            # resource, prefer the one whose resulting MAX normalised load is
+            # smallest — keeps every dimension loose, so fewer bins go slack.
+            ranked = []
+            for j in range(len(bins)):
+                ok = True
+                mx = 0.0
+                for r in res:
+                    cap = caps[j][r]
+                    if cap > 1e-9:
+                        nl = load[j][r] + d[r]
+                        if nl > cap + 1e-9:
+                            ok = False
+                            break
+                        mx = max(mx, nl / cap)
+                if ok:
+                    ranked.append((mx, j))
+            ranked.sort()
+            placed = False
+            for _, j in ranked:
+                if bins[j].try_add(it):
+                    for r in res:
+                        load[j][r] += d[r]
+                    placed = True
+                    break
+            if placed:
+                continue
+            nb = Bin3D(primary['type'], primary['W'], primary['D'], primary['H'],
+                       primary['max_weight'], primary['max_value'],
+                       primary['gravity'], primary['cost'])
+            if nb.try_add(it):
+                bins.append(nb)
+                caps.append({r: p_cap[r] for r in res})
+                load.append({r: d[r] for r in res})
+            else:
+                fb = open_bin(it, by_abs)
+                if fb is None:
+                    return None
+                bins.append(fb)
+                caps.append({'weight': fb.max_weight, 'value': fb.max_value,
+                             'vol': fb.W * fb.D * fb.H})
+                load.append({r: d[r] for r in res})
+        return bins
+
+    item_by_id = {it['id']: it for it in items_dicts}
+    candidates = []
+    for items_sorted in orderings:
+        if time.monotonic() > t_end:
+            break
+        bins = pack_one(items_sorted)
+        if not bins:
+            continue
+        for i in range(len(bins)):
+            if time.monotonic() > t_end:
+                break
+            items_in_b = [item_by_id[rec[0]] for rec in bins[i].items]
+            bins[i] = _retype_partial_bin(bins[i], items_in_b, by_abs, t_end)
+        candidates.append(bins)
+
+    if not candidates:
+        return None
+    return min(candidates, key=_cost)
+
+
+def construct_layered(items_dicts, vehicles, t_end):
+    """
+    Layer/shelf construction (generic geometric-density starter).
+
+    Packs into a roomy, volume-efficient primary vehicle with items ordered
+    tall-first then by footprint, so each bin grows in stable bottom layers.
+    This reaches different (often denser) volume-bound packings than the
+    vol-first / weight-first / vector constructors, giving the portfolio one
+    more geometric strategy. Purely additive — fed to the pool / incumbent,
+    kept only if it helps. Retypes every bin down to its cheapest vehicle.
+    """
+    if not items_dicts or not vehicles:
+        return None
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+    primary = min(vehicles, key=lambda v: v['cost'] / max(v['vol'], 1.0))
+    order = sorted(items_dicts,
+                   key=lambda it: (-it['maxdim'], -it['base_area'], -it['vol']))
+    bins = []
+    unplaced = list(order)
+    while unplaced:
+        if time.monotonic() > t_end:
+            return None
+        nb = Bin3D(primary['type'], primary['W'], primary['D'], primary['H'],
+                   primary['max_weight'], primary['max_value'],
+                   primary['gravity'], primary['cost'])
+        new_unplaced = []
+        for it in unplaced:
+            if not nb.try_add(it):
+                new_unplaced.append(it)
+        if not nb.items:
+            fb = open_bin(unplaced[0], by_abs)
+            if fb is None:
+                return None
+            bins.append(fb)
+            unplaced = unplaced[1:]
+            continue
+        bins.append(nb)
+        unplaced = new_unplaced
+    item_by_id = {it['id']: it for it in items_dicts}
+    for i in range(len(bins)):
+        if time.monotonic() > t_end:
+            break
+        items_in_b = [item_by_id[rec[0]] for rec in bins[i].items]
+        bins[i] = _retype_partial_bin(bins[i], items_in_b, by_abs, t_end)
+    return bins
+
+
 def construct_weight_packed_diverse(items_dicts, vehicles, t_end, rng,
                                     n_primaries=3, n_perturbed=2):
     """
@@ -1604,6 +2062,11 @@ def build_sequence(items, mode, rng):
         return sorted(items, key=lambda x: (-x['weight'], -x['vol']))
     if mode == 'value':
         return sorted(items, key=lambda x: (-x['value'], -x['vol']))
+    if mode == 'vmax':
+        # Dominant normalised resource pressure first (the dimension that will
+        # bind). vec_pressure is precomputed per instance in solve(); .get keeps
+        # this safe if it was never computed.
+        return sorted(items, key=lambda x: (-x.get('vec_pressure', 0.0), -x['vol']))
     if mode == 'maxdim':
         return sorted(items, key=lambda x: (-x['maxdim'], -x['vol']))
     if mode == 'footprint':
@@ -2857,6 +3320,27 @@ class solver_364130(AbstractSolver):
 
         items         = parse_items(self.inst.df_items)
         vehicles_all  = parse_vehicles(self.inst.df_vehicles)
+
+        # Float-safety switch (generic, data-driven — NOT dataset-specific):
+        # the checker compares geometry with strict, zero-tolerance arithmetic.
+        # Integer dimensions are exact in binary float, so touching/stacking is
+        # safe and we keep behaviour identical. Any non-integer dimension makes
+        # touching faces accumulate ~1e-9 float error that the checker flags as
+        # spurious overlap/gravity violations, so we pack with a tiny clearance.
+        global _SAFE, _SAFE_GRAV
+        def _is_int(val):
+            return abs(val - round(val)) < 1e-9
+        non_integer = (
+            any(not (_is_int(it['w']) and _is_int(it['d']) and _is_int(it['h']))
+                for it in items)
+            or any(not (_is_int(v['W']) and _is_int(v['D']) and _is_int(v['H']))
+                   for v in vehicles_all)
+        )
+        _SAFE      = 1e-7 if non_integer else 0.0
+        _SAFE_GRAV = 1e-6 if non_integer else 0.0
+        log(f"  Float-safety: "
+            f"{'ON (non-integer dims)' if non_integer else 'off (integer dims)'}")
+
         # Item hardness is computed from how many vehicle types can host the item
         # and how tight those fits are on key capacities; used only to drive
         # generic ordering heuristics, not dataset-specific tuning.
@@ -2868,7 +3352,22 @@ class solver_364130(AbstractSolver):
             it['fit_count'] = len(feasible_vs)
             if not feasible_vs:
                 it['hardness'] = 1e9
+                it['vec_pressure'] = 1e9
                 continue
+            # Generic 'vector pressure': the item's dominant resource demand
+            # normalised by the roomiest accepting vehicle's cap on that
+            # resource. Drives the 'vmax' ordering. A resource with no finite
+            # cap (e.g. infinite maxValue) contributes 0, so this never bakes
+            # in an assumption about which resource binds.
+            cap_w  = max(v['max_weight'] for v in feasible_vs)
+            cap_vol = max(v['vol'] for v in feasible_vs)
+            cap_val = max(v['max_value'] for v in feasible_vs)
+            p_w   = it['weight'] / cap_w if cap_w > 1e-9 else 0.0
+            p_vol = it['vol'] / cap_vol if cap_vol > 1e-9 else 0.0
+            p_val = (it['value'] / cap_val
+                     if (cap_val < 1e17 and cap_val > 1e-9 and it['value'] > 0)
+                     else 0.0)
+            it['vec_pressure'] = max(p_w, p_vol, p_val)
             min_cost = min(v['cost'] for v in feasible_vs)
             best_w_ratio = min(v['max_weight'] / max(it['weight'], 1e-9) for v in feasible_vs)
             best_vol_ratio = min(v['vol'] / max(it['vol'], 1e-9) for v in feasible_vs)
@@ -2962,6 +3461,10 @@ class solver_364130(AbstractSolver):
                 bins = construct_weight_packed(items, vehicles, t_p1)
             elif mode == 'volume':
                 bins = construct_volume_packed(items, vehicles, t_p1)
+            elif mode == 'vector':
+                bins = construct_vector_packed(items, vehicles, t_p1)
+            elif mode == 'layered':
+                bins = construct_layered(items, vehicles, t_p1)
             else:
                 return label, None, float('inf')
             if bins is None:
@@ -2997,8 +3500,10 @@ class solver_364130(AbstractSolver):
         # Resource-packed constructions: direct attack on weight/volume-binding
         # instances. Run in same thread pool as GRASP workers.
         resource_configs = [
-            ('w-pack',  'weight', seed0 + 50),
-            ('v-pack',  'volume', seed0 + 51),
+            ('w-pack',   'weight',  seed0 + 50),
+            ('v-pack',   'volume',  seed0 + 51),
+            ('vec-pack', 'vector',  seed0 + 52),
+            ('lay-pack', 'layered', seed0 + 53),
         ]
 
         with ThreadPoolExecutor(max_workers=self.N_THREADS) as ex:
@@ -3048,7 +3553,7 @@ class solver_364130(AbstractSolver):
 
         def _restart_worker(seed_base):
             rng = random.Random(seed_base)
-            modes = ['vol', 'weight', 'value', 'maxdim', 'footprint', 'densw', 'densv', 'mixed', 'shuffle']
+            modes = ['vol', 'weight', 'value', 'vmax', 'maxdim', 'footprint', 'densw', 'densv', 'mixed', 'shuffle']
             if self.DETERMINISTIC:
                 n_restarts = max(40, min(220, len(items) // 6))
                 for _ in range(n_restarts):
@@ -3137,6 +3642,14 @@ class solver_364130(AbstractSolver):
                         f"cost={_cost(vb):.2f}")
             except Exception as e:
                 log(f"  volume-packed seed failed: {e}")
+            try:
+                xb = construct_vector_packed(items, vehicles, t_seed_end)
+                if xb:
+                    pool.add_solution(xb)
+                    log(f"  Pre-seed vector-packed: {len(xb)} bins, "
+                        f"cost={_cost(xb):.2f}")
+            except Exception as e:
+                log(f"  vector-packed seed failed: {e}")
 
         # Diversified pre-seed: weight-FFD with top-3 CPW primaries plus a
         # cost-perturbed primary pick. The standard pre-seed only uses the
@@ -3316,7 +3829,7 @@ class solver_364130(AbstractSolver):
 
         # Multi-seed late intensification: short bursts on different vehicle orders.
         seed = seed0 + 2221
-        late_modes = ['vol', 'weight', 'value', 'maxdim', 'footprint', 'densw', 'densv', 'mixed', 'shuffle']
+        late_modes = ['vol', 'weight', 'value', 'vmax', 'maxdim', 'footprint', 'densw', 'densv', 'mixed', 'shuffle']
         if self.DETERMINISTIC:
             n_late = 24
             for i in range(n_late):
@@ -3466,21 +3979,34 @@ class solver_364130(AbstractSolver):
                     result.append(b)
             total = _cost(result)
 
+        # Expand each bin into checker-safe output bins. For non-integer
+        # instances this snaps coordinates / splits unfixable boxes so the
+        # strict, zero-tolerance checker accepts every bin, and we emit FULL
+        # PRECISION (no 9-decimal rounding, which would erase the sub-ULP snaps).
+        # Integer instances keep the original rounded, exact behaviour.
+        rnd = (lambda v: v) if non_integer else (lambda v: round(v, 9))
+        out_bins = []  # (vtype, [records])
+        for b in result:
+            if non_integer:
+                out_bins.extend(_repair_bin_for_checker(b, vehicles, ilookup))
+            else:
+                out_bins.append((b.vtype, list(b.items)))
+
         rows = []
         seen = set()
         idx_v = 0
-        for b in result:
+        for (vtype, recs) in out_bins:
             added = False
-            for (iid, x, y, z, iw, id_, ih, orient) in b.items:
+            for (iid, x, y, z, iw, id_, ih, orient) in recs:
                 if iid in seen:
                     continue
                 rows.append({
-                    'type_vehicle': b.vtype,
+                    'type_vehicle': vtype,
                     'idx_vehicle': idx_v,
                     'id_item': iid,
-                    'x_origin': round(y, 9),
-                    'y_origin': round(x, 9),
-                    'z_origin': round(z, 9),
+                    'x_origin': rnd(y),
+                    'y_origin': rnd(x),
+                    'z_origin': rnd(z),
                     'orient': int(orient),
                 })
                 seen.add(iid)
@@ -3500,13 +4026,31 @@ class solver_364130(AbstractSolver):
                         'type_vehicle': nb.vtype,
                         'idx_vehicle': idx_v,
                         'id_item': iid2,
-                        'x_origin': round(y, 9),
-                        'y_origin': round(x, 9),
-                        'z_origin': round(z, 9),
+                        'x_origin': rnd(y),
+                        'y_origin': rnd(x),
+                        'z_origin': rnd(z),
                         'orient': int(orient),
                     })
                     seen.add(iid2)
                 idx_v += 1
+
+        # Final safety net (non-integer instances): replay the assembled output
+        # through a literal checker and split any rejected box into its own floor
+        # bin — guarantees the written CSV is feasible regardless of any gap in
+        # the per-bin repair.
+        if non_integer and rows:
+            veh_by_type = {v['type']: v for v in vehicles_all}
+            rows, n_split = _enforce_checker_feasible(rows, ilookup, vehicles, veh_by_type)
+            if n_split:
+                log(f"  Final checker net: split {n_split} box(es) to floor bins")
+
+        # Recompute the true objective from the emitted bins (the checker repair
+        # may have split some bins, changing the cost from best_cost[0]).
+        _vcost = {v['type']: v['cost'] for v in vehicles_all}
+        _bin_type = {}
+        for r in rows:
+            _bin_type[r['idx_vehicle']] = r['type_vehicle']
+        total = sum(_vcost.get(t, 0.0) for t in _bin_type.values())
 
         log(f"\n{'═'*65}")
         log(f"  FINAL  cost={total:.2f}  bins={idx_v}  time={elapsed:.1f}s")

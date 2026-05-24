@@ -12,7 +12,7 @@ if __name__ == '__main__':
     from solver_356856 import solver_356856
     from solver_364130 import solver_364130
 
-    dataset_name = 'DatasetJ'
+    dataset_name = 'DatasetA'
 
     inst = Instance(dataset_name)
 
