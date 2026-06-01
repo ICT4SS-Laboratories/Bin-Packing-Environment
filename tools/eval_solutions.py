@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Batch evaluator for solver_364130 solutions.
+Batch evaluator for solver_364130_354977_356856_359530 solutions.
 
 For each requested dataset it:
   - re-runs the EXACT feasibility logic of the official results_checker.py
@@ -28,7 +28,7 @@ os.chdir(PROJ)
 import pandas as pd
 from instances import Instance
 
-SOLVER = 'solver_364130'
+SOLVER = 'solver_364130_354977_356856_359530'
 
 
 def expand(args):

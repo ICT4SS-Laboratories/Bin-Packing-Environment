@@ -167,7 +167,7 @@ def get_solution_cost(dataset_name, solver_name, vehicles):
 if __name__ == '__main__':
     datasets = ['DatasetA', 'DatasetB', 'DatasetC', 'DatasetD', 'DatasetE',
                 'DatasetF', 'DatasetG', 'DatasetH', 'DatasetI', 'DatasetJ']
-    solver = 'solver_364130'
+    solver = 'solver_364130_354977_356856_359530'
     competitor = 'solver_354977'
 
     print(f"\n{'='*120}")

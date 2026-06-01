@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Convenience runner: solve a list of datasets back-to-back with solver_364130,
+Convenience runner: solve a list of datasets back-to-back with solver_364130_354977_356856_359530,
 without touching the graded main.py. Each dataset uses the full time budget
 (env SOLVER_364130_TIME_LIMIT, default 600s) and writes results/sol_*.csv.
 
@@ -25,7 +25,7 @@ if __name__ == '__main__':
     os.chdir(PROJ)
 
     from instances import Instance
-    from solver_364130 import solver_364130
+    from solver_364130_354977_356856_359530 import solver_364130_354977_356856_359530
 
     chars = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ'
     args = sys.argv[1:] or ['K-Z']
@@ -44,7 +44,7 @@ if __name__ == '__main__':
     for ds in dsets:
         t0 = time.monotonic()
         inst = Instance(ds)
-        solver = solver_364130(inst)
+        solver = solver_364130_354977_356856_359530(inst)
         print(f"\n>>> {ds}: items={len(inst.df_items)} vehicles={len(inst.df_vehicles)}")
         solver.solve()
         print(f">>> {ds} done in {time.monotonic() - t0:.0f}s")

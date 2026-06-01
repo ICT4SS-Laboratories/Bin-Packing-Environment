@@ -4,7 +4,7 @@ from instances import Instance
 
 if __name__ == '__main__':
     dataset_name = 'DatasetA'
-    solver_name = 'solver_364130'
+    solver_name = 'solver_364130_354977_356856_359530'
     inst = Instance(dataset_name)
 
     # -------------------------

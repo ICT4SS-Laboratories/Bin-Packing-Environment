@@ -10,7 +10,7 @@ if __name__ == '__main__':
     vehicle_to_visualize = 0
 
     dataset_name = 'DatasetC'
-    solver_name = 'solver_364130'
+    solver_name = 'solver_364130_354977_356856_359530'
     inst = Instance(dataset_name)
 
     # -------------------------

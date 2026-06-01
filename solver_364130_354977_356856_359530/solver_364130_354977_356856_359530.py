@@ -1,5 +1,5 @@
 """
-solver_364130.py
+solver_364130_354977_356856_359530.py
 ================
 Heuristic 3D bin packing focused on:
 1) always returning feasible placements,
@@ -3289,7 +3289,7 @@ def vehicle_orderings(vehicles):
 #  SOLVER CLASS
 # ══════════════════════════════════════════════════════════════════════════════
 
-class solver_364130(AbstractSolver):
+class solver_364130_354977_356856_359530(AbstractSolver):
     """3-D Bin Packing: EP + GRASP + LNS + Column Generation + Set Partition MILP."""
 
     SOLVE_SECONDS  = int(os.getenv('SOLVER_364130_TIME_LIMIT', '600'))
@@ -3305,7 +3305,7 @@ class solver_364130(AbstractSolver):
 
     def __init__(self, inst):
         super().__init__(inst)
-        self.name = 'solver_364130'
+        self.name = 'solver_364130_354977_356856_359530'
 
     def solve(self):
         t0   = time.monotonic()
