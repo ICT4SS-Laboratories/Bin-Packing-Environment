@@ -179,6 +179,16 @@ candidate so a half-applied swap can't duplicate an item across two bins.
   complementary top-ups, jittered sweeps). Supplies the tight pair/triple
   columns the MILP needs on weight-/value-bound instances; skips vehicles
   where no item uses ≥5% of the caps (geometry-bound — nothing to gain).
+- **`generate_columns_pair_matching`**: deterministic two-pointer
+  max-cardinality pair matching on the binding normalised share (optimal pair
+  count for one capacity) — one column per pair on the most efficient vehicle
+  types. The wholesale alternative to singleton bins.
+- **Instance-adaptive budget split**: after Phase 1, if the incumbent's
+  weight/value fills dominate its volume fill (resource-bound instance),
+  Phase 2 (GRASP restarts — they plateau early on such fleets) is shortened
+  and every Phase-3 CG/MILP window is doubled. MILP column caps also scale
+  with the incumbent's bin count (≥4× bins), since a pool capped near the
+  solution size leaves the set-partition no combinatorial freedom.
 - `solve_set_partition` runs an exact **MILP** (HiGHS, fallback CP-SAT / SciPy)
   that selects the cheapest subset of columns covering every item exactly,
   warm-started with the incumbent. The pool is LP-filtered down to a column cap

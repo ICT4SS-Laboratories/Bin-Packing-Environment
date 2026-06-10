@@ -2609,10 +2609,36 @@ def op_drain_retype(bins, ilookup, vehicles, rng, t_end):
         return bins, False
     by_cost = sorted(vehicles, key=lambda v: v['cost'])
 
-    # Victims: biggest potential saving first = expensive bins with low
-    # binding fill (their load may fit a much cheaper vehicle after a shed).
-    order = sorted(range(n),
-                   key=lambda i: (-bins[i].cost * (1.0 - _bin_binding_fill(bins[i])),))
+    # Victim ranking by ACHIEVABLE saving, not by slack on the current
+    # vehicle: a tail bin can sit at 99% of its own caps and still be worth
+    # draining to a 2× cheaper class. For each bin, find the cheapest vehicle
+    # whose caps it could reach after shedding at most the AGGREGATE slack of
+    # the other bins (weight and value); the saving vs the current cost is
+    # the bin's drain potential.
+    tot_w_slack = sum((b.max_weight - b.weight) for b in bins
+                      if b.max_weight < 1e17)
+    tot_v_slack = sum((b.max_value - b.value) for b in bins
+                      if b.max_value < 1e17)
+
+    def drain_potential(i):
+        b = bins[i]
+        own_w = (b.max_weight - b.weight) if b.max_weight < 1e17 else 0.0
+        own_v = (b.max_value - b.value) if b.max_value < 1e17 else 0.0
+        sw = tot_w_slack - own_w
+        sv = tot_v_slack - own_v
+        best = 0.0
+        for v in by_cost:
+            if v['cost'] >= b.cost - 1e-9:
+                break
+            need_w = max(0.0, b.weight - v['max_weight'])
+            need_v = max(0.0, b.value - v['max_value'])
+            if need_w <= sw + 1e-9 and need_v <= sv + 1e-9:
+                best = b.cost - v['cost']
+                break
+        return best
+
+    order = sorted((i for i in range(n) if drain_potential(i) > 1e-9),
+                   key=lambda i: -drain_potential(i))
     tried = 0
     for vi in order:
         if time.monotonic() > t_end:
@@ -2653,9 +2679,15 @@ def op_drain_retype(bins, ilookup, vehicles, rng, t_end):
                     return nb
             return None
 
+        # Best achievable retype so far: do NOT return at the first success —
+        # keep draining; a deeper shed may fit an even cheaper vehicle (e.g.
+        # tail V5 → V6 after 3 swaps, → V7 after ~12 more). Snapshot on every
+        # strict improvement, return the best at the end.
+        best_snap = None
+        cheapest_cost = by_cost[0]['cost']
         moves = 0
         swaps = 0
-        while moves < 24 and time.monotonic() < t_end and rem_items:
+        while moves < 40 and time.monotonic() < t_end and rem_items:
             # 1) direct move: shed the heaviest-load item that fits somewhere.
             rem_items.sort(key=lambda it: -load_of(it))
             moved = None
@@ -2675,7 +2707,7 @@ def op_drain_retype(bins, ilookup, vehicles, rng, t_end):
             else:
                 # 2) swap fallback: trade a heavy victim item for a lighter
                 #    receiver item, strictly reducing the victim's load.
-                if swaps >= 16:
+                if swaps >= 28:
                     break
                 swaps += 1
                 done_swap = False
@@ -2730,15 +2762,21 @@ def op_drain_retype(bins, ilookup, vehicles, rng, t_end):
                 if not done_swap:
                     break
             if not rem_items:
+                # Victim fully emptied — nothing can beat this.
                 cand = receivers
                 if _cost(cand) < _cost(bins) - 1e-9:
                     return cand, True
                 break
             nb = try_retype(rem_items)
             if nb is not None and nb.cost < victim.cost - 1e-9:
-                cand = receivers + [nb]
-                if _cost(cand) < _cost(bins) - 1e-9:
-                    return cand, True
+                cand_cost = sum(rb.cost for rb in receivers) + nb.cost
+                if best_snap is None or cand_cost < best_snap[0] - 1e-9:
+                    best_snap = (cand_cost,
+                                 [rb.copy() for rb in receivers] + [nb])
+                if nb.cost <= cheapest_cost + 1e-9:
+                    break   # already on the cheapest vehicle — done
+        if best_snap is not None and best_snap[0] < _cost(bins) - 1e-9:
+            return best_snap[1], True
     return bins, False
 
 
@@ -3810,6 +3848,75 @@ def generate_columns_resource_knapsack(items, vehicles, rng, t_end, n_cols=400):
     return out
 
 
+def generate_columns_pair_matching(items, vehicles, t_end):
+    """
+    Deterministic max-cardinality PAIR layer for the most resource-efficient
+    vehicle types.
+
+    Classic two-pointer matching on the binding normalised share: items
+    sorted ascending; the smallest unmatched item is paired with the largest
+    one it fits with (both weight and value caps). For one capacity this
+    yields the maximum number of pairs; with two correlated resources it
+    stays near-optimal. Emits one column per pair — together with the
+    knapsack columns this gives the set-partition MILP a complete,
+    high-utilisation alternative layer over the eligible items (the EP/GRASP
+    pipeline tends to leave such items in singleton bins, paying one
+    container each). Skips vehicles where no item uses ≥5% of the caps.
+    """
+    out = []
+    if len(items) < 2:
+        return out
+    res, _tot = _active_resources(items, vehicles)
+    res = [r for r in res if r in ('weight', 'value')]
+    if not res:
+        return out
+    cand, seen = [], set()
+    for r in res:
+        key = (lambda v: v['max_weight']) if r == 'weight' else (lambda v: v['max_value'])
+        vs = [v for v in vehicles if 0.0 < key(v) < 1e17]
+        vs.sort(key=lambda v: v['cost'] / key(v))
+        for v in vs[:2]:
+            if v['type'] not in seen:
+                seen.add(v['type'])
+                cand.append(v)
+    for v in cand:
+        if time.monotonic() > t_end:
+            break
+        capw, capv = v['max_weight'], v['max_value']
+
+        def share(it):
+            s = 0.0
+            if 0.0 < capw < 1e17:
+                s = max(s, it['weight'] / capw)
+            if 0.0 < capv < 1e17:
+                s = max(s, it['value'] / capv)
+            return s
+
+        elig = [it for it in items
+                if share(it) > 0.05 and _vehicle_accepts_item(it, v)]
+        if len(elig) < 2:
+            continue
+        elig.sort(key=share)
+        lo, hi = 0, len(elig) - 1
+        while lo < hi:
+            if time.monotonic() > t_end:
+                break
+            a, b_ = elig[lo], elig[hi]
+            if (a['weight'] + b_['weight'] <= capw + 1e-9
+                    and a['value'] + b_['value'] <= capv + 1e-9):
+                nb = Bin3D(v['type'], v['W'], v['D'], v['H'], capw, capv,
+                           v['gravity'], v['cost'])
+                if nb.try_add(b_) and nb.try_add(a):
+                    out.append(nb)
+                    lo += 1
+                    hi -= 1
+                else:
+                    hi -= 1   # geometric failure — heaviest goes unmatched
+            else:
+                hi -= 1       # heaviest pairs with nothing — singleton
+    return out
+
+
 def path_relinking(incumbent, pool, ilookup, vehicles, t_end, rng):
     """
     Path Relinking from column pool to incumbent.
@@ -4327,11 +4434,34 @@ class solver_364130_354977_356856_359530(AbstractSolver):
         log(f"\n  After Phase 1: cost={best_cost[0]:.2f}  bins={len(best_bins[0])}"
             f"  columns={pool.size()}")
 
+        # Instance-adaptive budget split (data-driven, no dataset switches):
+        # when the incumbent's weight/value fills dominate its volume fill,
+        # the instance is RESOURCE-bound — GRASP restarts plateau early there,
+        # while the gap actually closes in column generation + set-partition
+        # MILP. Shift budget from Phase 2 to Phases 3/4 in that case.
+        resource_bound = False
+        if best_bins[0]:
+            rf, vf = [], []
+            for b in best_bins[0]:
+                vf.append(b.vol_used / max(1.0, b.W * b.D * b.H))
+                f = 0.0
+                if 0.0 < b.max_weight < 1e17:
+                    f = max(f, b.weight / b.max_weight)
+                if 0.0 < b.max_value < 1e17:
+                    f = max(f, b.value / b.max_value)
+                rf.append(f)
+            avg_r = sum(rf) / len(rf)
+            avg_v = sum(vf) / len(vf)
+            resource_bound = avg_r > 0.60 and avg_r > 1.5 * avg_v
+        cg_mult = 2.0 if resource_bound else 1.0
+        if resource_bound:
+            log("  Instance profile: RESOURCE-bound → extended CG/MILP budget")
+
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 2 — LNS + GRASP restarts
         # ─────────────────────────────────────────────────────────────────────
         log(f"\n  Phase 2  —  GRASP restarts + LNS  (column harvesting)")
-        t_p2      = tend - 75.0
+        t_p2      = tend - (150.0 if resource_bound else 75.0)
         restarts  = [0]
 
         def _deep_lns():
@@ -4415,7 +4545,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
         # budget shared with 12 GRASP workers, so it may not exhaust all
         # primary/ordering combinations; this pass gets a dedicated 10s and adds
         # any extra columns the pool didn't already have.
-        t_seed_end = min(time.monotonic() + 10.0, tend - 55.0)
+        t_seed_end = min(time.monotonic() + 10.0 * cg_mult, tend - 55.0)
         if t_seed_end > time.monotonic() + 1.0:
             try:
                 wb = construct_weight_packed(items, vehicles, t_seed_end)
@@ -4478,7 +4608,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
 
 
         # Split CG budget: ~70% item-centric, ~30% pair-seeded for diversity.
-        t_cg_total = min(time.monotonic() + 22.0, tend - 50.0)
+        t_cg_total = min(time.monotonic() + 22.0 * cg_mult, tend - 50.0)
         t_cg_pair_split = time.monotonic() + max(2.0, (t_cg_total - time.monotonic()) * 0.30)
 
         # Pair-seeded columns first (cheap, structurally diverse)
@@ -4494,15 +4624,29 @@ class solver_364130_354977_356856_359530(AbstractSolver):
         # Knapsack-fill columns: tight pair/triple columns on the most
         # cost-efficient vehicle classes (no-op on fleets with no finite
         # weight/value caps — see _active_resources).
-        t_cg_knap = min(time.monotonic() + 6.0, t_cg_total)
+        t_cg_knap = min(time.monotonic() + 6.0 * cg_mult, t_cg_total)
         try:
             for b in generate_columns_resource_knapsack(
                 items, vehicles_all, rng_cg, t_cg_knap,
-                n_cols=max(120, len(items) // 2),
+                n_cols=max(200, len(items)),
             ):
                 pool.add_bin(b)
         except Exception as e:
             log(f"  knapsack CG failed: {e}")
+
+        # Max-cardinality pair layer (deterministic, cheap): the wholesale
+        # alternative to singleton bins on resource-bound fleets.
+        try:
+            n_pm = 0
+            for b in generate_columns_pair_matching(
+                items, vehicles_all, min(time.monotonic() + 4.0, t_cg_total)
+            ):
+                pool.add_bin(b)
+                n_pm += 1
+            if n_pm:
+                log(f"  Pair-matching CG: {n_pm} pair columns")
+        except Exception as e:
+            log(f"  pair-matching CG failed: {e}")
 
         # Item-centric columns on the remaining budget
         for i, item in enumerate(sorted(items, key=lambda x: -x['vol'])):
@@ -4530,8 +4674,13 @@ class solver_364130_354977_356856_359530(AbstractSolver):
         cols = pool.get_columns()
         log(f"  Column pool size: {len(cols)}")
 
-        milp_budget = min(34.0, tend - time.monotonic() - 24.0)
-        milp_cols   = min(3500, max(1200, len(all_ids) // 2 + 1000))
+        milp_budget = min(34.0 * cg_mult, tend - time.monotonic() - 24.0)
+        # Column cap must scale with the SOLUTION size: with ~N bins to pick,
+        # a pool capped near N leaves the MILP no combinatorial freedom
+        # (e.g. 461-bin covers vs a 1400-column pool ≈ 3 candidates per slot).
+        n_inc_bins = len(best_bins[0]) if best_bins[0] else 0
+        milp_cols   = min(3500, max(1200, len(all_ids) // 2 + 1000,
+                                    4 * n_inc_bins))
         milp_improved = False
         if milp_budget > 5.0 and cols:
             log(f"  Running MILP  (budget={milp_budget:.0f}s, cols={milp_cols}) ...")
@@ -4570,7 +4719,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                     f"(commit gated on MILP-2 improvement)")
 
         # Extra intensification: mine columns near incumbent, then rerun MILP.
-        t_mine = min(time.monotonic() + 32.0, tend - 18.0)
+        t_mine = min(time.monotonic() + 32.0 * cg_mult, tend - 18.0)
         if t_mine > time.monotonic() + 2.0 and best_bins[0]:
             with lock:
                 incumbent = [b.copy() for b in best_bins[0]]
@@ -4581,7 +4730,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
             log(f"  Column pool after intensification: {len(cols2)}")
             # MILP-2 gets pool + shadow CG cols; commit decision below.
             cols2_for_milp = cols2 + cg_shadow_cols if cg_shadow_cols else cols2
-            milp_budget2 = min(12.0, tend - time.monotonic() - 10.0)
+            milp_budget2 = min(12.0 * cg_mult, tend - time.monotonic() - 10.0)
             milp_cols2 = min(4000, milp_cols + 600)
             run_milp2 = milp_improved or (len(cols2) >= len(cols) + 120) or bool(cg_shadow_cols)
             if milp_budget2 > 4.0 and cols2_for_milp and run_milp2:
@@ -4753,8 +4902,9 @@ class solver_364130_354977_356856_359530(AbstractSolver):
             if cols3:
                 # Budget shaved 1s vs original (was rem-0.8) so there is a
                 # meaningful tail window for the post-MILP polish below.
-                budget3 = min(12.0, rem - 1.8)
-                cols_cap3 = min(4500, max(1500, len(all_ids) + 1000))
+                budget3 = min(12.0 * cg_mult, rem - 1.8)
+                cols_cap3 = min(4500, max(1500, len(all_ids) + 1000,
+                                          5 * len(best_bins[0] or [])))
                 with lock:
                     warm_keys3 = [frozenset(rec[0] for rec in b.items) for b in (best_bins[0] or [])]
                 selected3, milp_cost3 = solve_set_partition(
