@@ -681,7 +681,13 @@ def op_eject(bins, ilookup, vehicles, rng, t_end, destroy_rate=0.33):
     eject_items=[ilookup[r[0]] for r in eject_recs]
     src=Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
     for rec in b.items:
-        if rec[0] not in eject_ids: src.try_add(ilookup[rec[0]])
+        if rec[0] not in eject_ids:
+            # Re-packing the kept items is order-dependent; if one no longer
+            # fits, the item would silently VANISH from the solution (cost
+            # looks lower, update_best accepts, final repair re-adds it in a
+            # fresh bin — a net loss). Abort instead.
+            if not src.try_add(ilookup[rec[0]]):
+                return bins,False
     work=[bins[i].copy() for i in range(len(bins)) if i!=bi]
     work.insert(bi,src)
     others=[work[i] for i in range(len(work)) if i!=bi]
@@ -755,9 +761,16 @@ def op_swap_pair(bins, ilookup, vehicles, rng, t_end):
             for ra in ra_pool:
                 ia = ilookup[ra[0]]
                 a_new = Bin3D(a.vtype,a.W,a.D,a.H,a.max_weight,a.max_value,a.gravity,a.cost)
+                # Re-pack is order-dependent: a failed try_add would silently
+                # DROP the item from the solution. Discard this candidate.
+                a_ok = True
                 for r2 in a.items:
                     if r2[0] != ra[0]:
-                        a_new.try_add(ilookup[r2[0]])
+                        if not a_new.try_add(ilookup[r2[0]]):
+                            a_ok = False
+                            break
+                if not a_ok:
+                    continue
                 for rb in rb_pool:
                     if time.monotonic() > t_end:
                         return bins, False
@@ -765,15 +778,24 @@ def op_swap_pair(bins, ilookup, vehicles, rng, t_end):
                         continue
                     ib = ilookup[rb[0]]
                     b_new = Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
+                    b_ok = True
                     for r2 in b.items:
                         if r2[0] != rb[0]:
-                            b_new.try_add(ilookup[r2[0]])
-                    if not a_new.try_add(ib):
+                            if not b_new.try_add(ilookup[r2[0]]):
+                                b_ok = False
+                                break
+                    if not b_ok:
+                        continue
+                    # Work on a copy: a successful try_add(ib) followed by a
+                    # failed try_add(ia) must not pollute a_new for the next
+                    # rb candidate (it would duplicate ib across two bins).
+                    a_try = a_new.copy()
+                    if not a_try.try_add(ib):
                         continue
                     if not b_new.try_add(ia):
                         continue
                     test_bins = [bins[k].copy() for k in range(n)]
-                    test_bins[ai] = a_new
+                    test_bins[ai] = a_try
                     test_bins[bi] = b_new
                     if _cost(test_bins) < _cost(bins) - 1e-9:
                         return test_bins, True
@@ -992,9 +1014,21 @@ def op_weight_pair_repack(bins, ilookup, vehicles, rng, t_end):
         if time.monotonic() > t_end:
             break
         v_spec = vmap[vtype]
-        # Items with their bin index, sorted by weight ASC
+        # Sort by the item's BINDING normalised demand on this vehicle (max of
+        # weight/value share) — weight-only ordering breaks the two-pointer on
+        # value-bound fleets (pairs would be proposed that the value cap then
+        # rejects, and real value-pairs are never tried).
+        capw = v_spec['max_weight']
+        capv = v_spec['max_value']
+        def _share(it):
+            s = 0.0
+            if 0.0 < capw < 1e17:
+                s = max(s, it['weight'] / capw)
+            if 0.0 < capv < 1e17:
+                s = max(s, it['value'] / capv)
+            return s
         items_with_idx = [(idx, ilookup[bins[idx].items[0][0]]) for idx in indices]
-        items_with_idx.sort(key=lambda x: x[1]['weight'])
+        items_with_idx.sort(key=lambda x: _share(x[1]))
 
         lo, hi = 0, len(items_with_idx) - 1
         while lo < hi:
@@ -1327,11 +1361,12 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
         ('WPAIR',  lambda c: op_weight_pair_repack(c, ilookup, vehicles, rng, t_end)),
         ('SPLIT',  lambda c: op_bin_split(c, ilookup, vehicles, rng, t_end)),
         ('REDIS',  lambda c: op_redistribute_then_retype(c, ilookup, vehicles, rng, t_end)),
+        ('DRAIN',  lambda c: op_drain_retype(c, ilookup, vehicles, rng, t_end)),
     ]
     decay_factor = {'RELOC': 0.88, 'RETYPE': 0.92, 'RETALL': 0.94, 'SHAKE': 0.92,
                     'MERGE3': 0.90, 'EJECT': 0.95, 'SWAP': 0.93,
                     'CONS2': 0.92, 'RUIN': 0.95, 'RUIN_STRONG': 0.97,
-                    'WPAIR': 0.92, 'SPLIT': 0.93, 'REDIS': 0.94}
+                    'WPAIR': 0.92, 'SPLIT': 0.93, 'REDIS': 0.94, 'DRAIN': 0.93}
     n_ops    = len(sec_ops)
     weights  = [1.0] * n_ops
     reaction = 0.40   # how aggressively we update weights on success
@@ -1441,6 +1476,7 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
             lambda x: op_redistribute_then_retype(x, ilookup, vehicles, rng, t_end),
             lambda x: op_consolidate_pair(x, ilookup, vehicles, rng, t_end),
             lambda x: op_weight_pair_repack(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_drain_retype(x, ilookup, vehicles, rng, t_end),
             lambda x: op_relocate(x, ilookup, vehicles, rng, t_end),
             lambda x: op_retype_all(x, ilookup, vehicles, t_end),
             lambda x: op_retype(x, ilookup, vehicles, rng, t_end),
@@ -1892,6 +1928,497 @@ def construct_layered(items_dicts, vehicles, t_end):
     return bins
 
 
+def _build_tower_bins(plan, primary, by_abs, t_end, opener='deep'):
+    """
+    Shelf-pack tower groups into bins of *primary*.
+
+    plan: list of {'alts': [(fw, fd, rot), ...], 'fh', 'items'} — one entry per
+    identical-dims group; 'alts' are the equal-height footprint orientations
+    (e.g. 1200×800 and 800×1200), so a tower can rotate to exploit a leftover
+    floor strip. Items inside a group are popped lightest-first so resource
+    caps cut towers as late as possible.
+
+    Shelves run along the depth axis; towers are placed left-to-right along
+    the width. opener='deep' starts each shelf with the deepest fitting
+    footprint (classic shelf-decreasing), 'shallow' with the shallowest that
+    spans the width best — the two reach different dense layouts, and all
+    candidates are fed to the column pool for the MILP to mix.
+
+    Each tower stacks identical footprints (full support ⇒ gravity-safe at any
+    gravityStrength on integer instances; on non-integer 100%-gravity
+    instances _grav_ok rejects the 2nd level and towers degrade to single
+    layers, consistent with the solver's float-safety policy). Every placement
+    is verified with _overlaps/_grav_ok before committing. Returns list of
+    bins, or None on timeout/dead-end.
+    """
+    s = _SAFE
+    W, D, H = primary['W'], primary['D'], primary['H']
+    work = []
+    for g in plan:
+        gg = dict(g)
+        gg['items'] = sorted(g['items'], key=lambda it: (it['weight'] + it['value']))
+        work.append(gg)
+    bins = []
+    guard = 0
+    while any(g['items'] for g in work):
+        if time.monotonic() > t_end:
+            return None
+        guard += 1
+        if guard > 100000:
+            return None
+        b = Bin3D(primary['type'], W, D, H, primary['max_weight'],
+                  primary['max_value'], primary['gravity'], primary['cost'])
+        y = 0.0
+        while True:
+            combos = [(g, fw, fd, rot)
+                      for g in work
+                      if g['items']
+                      and b.cap_ok(g['items'][0]['weight'], g['items'][0]['value'])
+                      for (fw, fd, rot) in g['alts']
+                      if fd <= D - y - s + 1e-9 and fw <= W - s + 1e-9]
+            if not combos:
+                break
+            if opener == 'deep':
+                combos.sort(key=lambda c: (-c[2], -(c[1] * c[2])))
+            else:
+                combos.sort(key=lambda c: (c[2], -(c[1] * c[2])))
+            shelf_d = combos[0][2]
+            x = 0.0
+            shelf_used = False
+            while True:
+                cand = [(g, fw, fd, rot)
+                        for g in work
+                        if g['items']
+                        and b.cap_ok(g['items'][0]['weight'], g['items'][0]['value'])
+                        for (fw, fd, rot) in g['alts']
+                        if fd <= shelf_d + 1e-9 and fw <= W - x - s + 1e-9]
+                if not cand:
+                    break
+                # Fill the shelf depth as fully as possible, then prefer the
+                # widest footprint (fewer slivers left in the shelf).
+                cand.sort(key=lambda c: (-c[2], -(c[1] * c[2])))
+                g, fw, fd, rot = cand[0]
+                fh = g['fh']
+                z = 0.0
+                tower_n = 0
+                while (g['items']
+                       and z + fh <= H - s + 1e-9
+                       and b.cap_ok(g['items'][0]['weight'], g['items'][0]['value'])):
+                    if b._overlaps(x, y, z, fw, fd, fh):
+                        break
+                    if z > 1e-12 and not b._grav_ok(x, y, z, fw, fd, fh):
+                        break
+                    it = g['items'].pop(0)
+                    b.place(it['id'], x, y, z, fw, fd, fh, rot,
+                            it['weight'], it['value'])
+                    z += fh + s
+                    tower_n += 1
+                if tower_n == 0:
+                    # nothing placeable at this x (overlap anomaly) — skip group
+                    # for this shelf position by advancing past its width
+                    x += fw + s
+                    continue
+                shelf_used = True
+                x += fw + s
+            if not shelf_used:
+                break
+            y += shelf_d + s
+        if b.items:
+            bins.append(b)
+        else:
+            # No tower item placeable in a fresh primary bin (caps too tight
+            # for even the lightest item) — fall back to a dedicated bin.
+            g = next(g for g in work if g['items'])
+            it = g['items'].pop(0)
+            fb = open_bin(it, by_abs)
+            if fb is None:
+                return None
+            bins.append(fb)
+    return bins
+
+
+def _pattern_cover_bins(patterns, glist, primary, t_end):
+    """
+    Cutting-stock style pattern cover over tower templates.
+
+    patterns: {counts_key: template} where counts_key is a tuple of per-group
+    item counts and template is the list of placements
+    [(x, y, z, iw, id_, ih, rot, group_idx), ...] mined from one tower bin.
+
+    Greedy tower runs PARTITION the items, so per-run bins overlap item-wise
+    across runs and the set-partition MILP cannot mix patterns from different
+    runs. Items inside a group are geometrically identical though — only the
+    PATTERN matters. So: solve the small integer cover
+        min Σ x_p   s.t.   Σ_p x_p · cnt[p][g] ≥ |group g|
+    (groups × patterns is tiny) and materialize the chosen bins by filling
+    template slots with concrete items, lightest-first, caps checked. Items
+    in groups no pattern covers are left to the caller. Returns
+    (bins, leftover_items) or None.
+    """
+    if not patterns:
+        return None
+    plist = list(patterns.items())
+    cov_groups = sorted({gi for counts, _ in plist
+                         for gi, c in enumerate(counts) if c > 0})
+    if not cov_groups:
+        return None
+    demand = np.array([len(glist[gi]) for gi in cov_groups], dtype=float)
+    A = np.zeros((len(cov_groups), len(plist)))
+    for pj, (counts, _) in enumerate(plist):
+        for ri, gi in enumerate(cov_groups):
+            A[ri, pj] = counts[gi]
+    # Every constrained group must be coverable by some pattern.
+    if (A.sum(axis=1) <= 0).any():
+        return None
+    try:
+        res = milp(
+            c=np.ones(len(plist)),
+            constraints=LinearConstraint(A, lb=demand, ub=np.inf),
+            integrality=np.ones(len(plist)),
+            bounds=Bounds(0, float(demand.sum())),
+            options={'time_limit': max(1.0, min(5.0, t_end - time.monotonic()))},
+        )
+    except Exception:
+        return None
+    if res is None or not res.success or res.x is None:
+        return None
+    counts_sel = [int(round(v)) for v in res.x]
+
+    remaining = {gi: sorted(glist[gi], key=lambda it: it['weight'] + it['value'])
+                 for gi in range(len(glist))}
+    bins = []
+    for pj, n_use in enumerate(counts_sel):
+        template = plist[pj][1]
+        for _ in range(n_use):
+            if time.monotonic() > t_end:
+                return None
+            b = Bin3D(primary['type'], primary['W'], primary['D'], primary['H'],
+                      primary['max_weight'], primary['max_value'],
+                      primary['gravity'], primary['cost'])
+            for (x, y, z, iw, id_, ih, rot, gi) in template:
+                grp = remaining.get(gi)
+                if not grp:
+                    continue
+                it = grp[0]
+                if not b.cap_ok(it['weight'], it['value']):
+                    continue
+                # Slots come bottom-up per tower; a skipped lower slot makes
+                # upper slots unsupported, so verify support explicitly.
+                if b._overlaps(x, y, z, iw, id_, ih):
+                    continue
+                if z > 1e-12 and not b._grav_ok(x, y, z, iw, id_, ih):
+                    continue
+                b.place(it['id'], x, y, z, iw, id_, ih, rot,
+                        it['weight'], it['value'])
+                grp.pop(0)
+            if b.items:
+                bins.append(b)
+    leftover = [it for grp in remaining.values() for it in grp]
+    if not bins:
+        return None
+    return bins, leftover
+
+
+def construct_towers(items_dicts, vehicles, t_end, pool=None):
+    """
+    Tower/shelf constructor for volume-bound fleets with repeated shapes.
+
+    Groups identical-dims items, stacks each group into full-support towers
+    and shelf-packs the tower footprints on the container floor. Identical
+    footprints stacked at the same (x,y) support each other completely, so
+    towers satisfy ANY gravityStrength — this reaches dense, tall packings
+    that the EP scorer (which prefers low-z, wide placements) rarely finds,
+    e.g. items standing on their smallest face filling the full height.
+
+    Tries 3 height policies × 2 shelf openers × top-2 cost-per-volume
+    primaries; ALL full covers are fed to *pool* (the set-partition MILP can
+    then mix per-bin patterns from different runs — e.g. mono-type bins from
+    one policy with mixed bins from another), and the cheapest is returned.
+    Purely additive portfolio member, instance-driven only.
+    """
+    if not items_dicts or not vehicles:
+        return None
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+    prims = sorted(vehicles, key=lambda v: (v['cpv'], v['cost']))
+    prims = prims[:min(2, len(prims))]
+
+    groups = {}
+    for it in items_dicts:
+        key = (it['w'], it['d'], it['h'],
+               tuple(sorted(r for (r, *_d) in it['urots'])))
+        groups.setdefault(key, []).append(it)
+    glist = list(groups.values())
+    item_by_id = {it['id']: it for it in items_dicts}
+
+    id2gi = {it['id']: gi for gi, g in enumerate(glist) for it in g}
+    # Pattern mining only pays off when shapes repeat (groups have real
+    # multiplicity); with mostly unique shapes the cover IP degenerates into
+    # plain set cover over raw columns, which the main MILP already does.
+    mine_patterns = len(items_dicts) >= 3 * max(1, len(glist))
+
+    candidates = []
+    for primary in prims:
+        W, D, H = primary['W'], primary['D'], primary['H']
+        prim_patterns = {}
+        for policy in (0, 1, 2):
+            if time.monotonic() > t_end:
+                break
+            plan, rest = [], []
+            for g in glist:
+                it0 = g[0]
+                best = None
+                for (rot, iw, id_, ih) in it0['urots']:
+                    if iw > W - _SAFE + 1e-9 or id_ > D - _SAFE + 1e-9 \
+                            or ih > H - _SAFE + 1e-9 or ih <= 1e-12:
+                        continue
+                    k = int((H - _SAFE + 1e-9) // ih)
+                    if k < 1:
+                        continue
+                    waste = H - k * ih
+                    if policy == 0:
+                        score = (waste / max(H, 1e-9), iw * id_)   # min wasted height
+                    elif policy == 1:
+                        score = (-(iw * id_), waste)               # widest footprint
+                    else:
+                        score = (iw * id_, waste)                  # tallest/thinnest
+                    if best is None or score < best[0]:
+                        best = (score, rot, iw, id_, ih)
+                if best is None:
+                    rest.extend(g)
+                else:
+                    fh = best[4]
+                    # Equal-height footprint alternatives (e.g. the z-rotated
+                    # footprint) let a tower turn to fit a leftover strip.
+                    alts, seen_fp = [], set()
+                    for (rot2, iw, id_, ih) in it0['urots']:
+                        if abs(ih - fh) > 1e-12:
+                            continue
+                        if iw > W - _SAFE + 1e-9 or id_ > D - _SAFE + 1e-9:
+                            continue
+                        fp = (iw, id_)
+                        if fp in seen_fp:
+                            continue
+                        seen_fp.add(fp)
+                        alts.append((iw, id_, rot2))
+                    plan.append({'alts': alts, 'fh': fh, 'items': g})
+            if not plan:
+                continue
+            for opener in ('deep', 'shallow'):
+                if time.monotonic() > t_end:
+                    break
+                bins = _build_tower_bins(plan, primary, by_abs, t_end,
+                                         opener=opener)
+                if bins is None:
+                    continue
+                # Mine per-bin patterns (group-count vectors + placement
+                # templates) BEFORE squeeze/retype — pure tower bins only.
+                if mine_patterns and len(prim_patterns) < 400:
+                    for b in bins:
+                        if b.vtype != primary['type']:
+                            continue
+                        counts = [0] * len(glist)
+                        tmpl = []
+                        for (iid, x, y, z, iw, id_, ih, rot) in b.items:
+                            gi = id2gi[iid]
+                            counts[gi] += 1
+                            tmpl.append((x, y, z, iw, id_, ih, rot, gi))
+                        key = tuple(counts)
+                        if key not in prim_patterns \
+                                or len(tmpl) > len(prim_patterns[key]):
+                            prim_patterns[key] = tmpl
+                # Squeeze non-tower items into spare geometry, tail-pack rest.
+                still = []
+                ok = True
+                for it in sorted(rest, key=lambda x: -x['vol']):
+                    placed = False
+                    for b in sorted(bins, key=lambda bb: -bb.rem_vol()):
+                        if b.try_add(it):
+                            placed = True
+                            break
+                    if not placed:
+                        still.append(it)
+                if still:
+                    tail_bins, unp = pack(sorted(still, key=lambda x: -x['vol']),
+                                          by_abs, t_end=t_end)
+                    if unp:
+                        ok = False
+                    else:
+                        bins.extend(tail_bins)
+                if not ok:
+                    continue
+                for i in range(len(bins)):
+                    if time.monotonic() > t_end:
+                        break
+                    items_in_b = [item_by_id[rec[0]] for rec in bins[i].items]
+                    bins[i] = _retype_partial_bin(bins[i], items_in_b, by_abs,
+                                                  t_end)
+                if pool is not None:
+                    pool.add_solution(bins)
+                candidates.append(bins)
+
+        # Cutting-stock pattern cover for this primary: greedy runs partition
+        # the items, so their bins can't be mixed by the set-partition MILP
+        # (overlapping item sets). The pattern-level cover IP CAN mix them —
+        # e.g. mono-type bins from one policy with mixed bins from another.
+        if mine_patterns and prim_patterns and time.monotonic() < t_end:
+            try:
+                pc = _pattern_cover_bins(prim_patterns, glist, primary, t_end)
+            except Exception:
+                pc = None
+            if pc:
+                pbins, leftover = pc
+                still = []
+                for it in sorted(leftover, key=lambda x: -x['vol']):
+                    placed = False
+                    for b in sorted(pbins, key=lambda bb: -bb.rem_vol()):
+                        if b.try_add(it):
+                            placed = True
+                            break
+                    if not placed:
+                        still.append(it)
+                ok = True
+                if still:
+                    tail_bins, unp = pack(
+                        sorted(still, key=lambda x: -x['vol']),
+                        by_abs, t_end=t_end)
+                    if unp:
+                        ok = False
+                    else:
+                        pbins.extend(tail_bins)
+                if ok:
+                    for i in range(len(pbins)):
+                        if time.monotonic() > t_end:
+                            break
+                        items_in_b = [item_by_id[rec[0]]
+                                      for rec in pbins[i].items]
+                        pbins[i] = _retype_partial_bin(pbins[i], items_in_b,
+                                                       by_abs, t_end)
+                    if pool is not None:
+                        pool.add_solution(pbins)
+                    candidates.append(pbins)
+
+    if not candidates:
+        return None
+    return min(candidates, key=_cost)
+
+
+def construct_knapsack_packed(items_dicts, vehicles, t_end):
+    """
+    Tight-fill (knapsack-FFD) constructor for resource-bound fleets.
+
+    Generic two-tier structure, derived from the instance at runtime:
+      · each item is routed to the vehicle type that is CHEAPEST PER UNIT of
+        the item's binding resource among the types that accept it (so e.g.
+        items too heavy/valuable for the most efficient small vehicle fall
+        back to the next-best class — no hardcoded fleet assumptions);
+      · within each tier, items are packed first-fit in DESCENDING binding
+        share, which fills every bin as close to its cap as the item mix
+        allows (pairs/triples emerge naturally);
+      · zero-demand items (no weight, no value) and leftovers are squeezed
+        into the open bins' spare geometry, then tail-packed;
+      · every bin is finally retyped down to its cheapest viable vehicle.
+
+    Complements construct_weight_packed (LPT spreads load evenly — good when
+    the minimum bin count is reachable, weak when items are lumpy) and
+    construct_vector_packed (balanced best-fit). Returns bins or None.
+    """
+    if not items_dicts or not vehicles:
+        return None
+    res, _tot = _active_resources(items_dicts, vehicles)
+    res = [r for r in res if r in ('weight', 'value')]
+    if not res:
+        return None
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+
+    def share(it, v):
+        s = 0.0
+        if 0.0 < v['max_weight'] < 1e17:
+            s = max(s, it['weight'] / v['max_weight'])
+        if 0.0 < v['max_value'] < 1e17:
+            s = max(s, it['value'] / v['max_value'])
+        return s
+
+    def unit_cost(it, v):
+        sh = share(it, v)
+        if sh <= 1e-12:
+            return v['cost'] * 1e-6
+        return v['cost'] * sh
+
+    # Route each demanding item to its cheapest-per-unit accepting vehicle.
+    tiers = {}     # vtype -> [items]
+    vmap = {v['type']: v for v in vehicles}
+    rest = []      # zero-demand items (pure geometry)
+    for it in items_dicts:
+        if it['weight'] <= 1e-12 and it['value'] <= 1e-12:
+            rest.append(it)
+            continue
+        best_v, best_c = None, float('inf')
+        for v in vehicles:
+            if not _vehicle_accepts_item(it, v):
+                continue
+            c = unit_cost(it, v)
+            if c < best_c - 1e-12:
+                best_c, best_v = c, v
+        if best_v is None:
+            return None
+        tiers.setdefault(best_v['type'], []).append(it)
+
+    bins = []
+    for vtype, tier_items in sorted(tiers.items(),
+                                    key=lambda kv: -vmap[kv[0]]['cost']):
+        v = vmap[vtype]
+        tier_items.sort(key=lambda it: -share(it, v))
+        open_tier = []
+        for it in tier_items:
+            if time.monotonic() > t_end:
+                return None
+            placed = False
+            for b in open_tier:
+                if not b.cap_ok(it['weight'], it['value']):
+                    continue
+                if b.try_add(it):
+                    placed = True
+                    break
+            if not placed:
+                nb = Bin3D(v['type'], v['W'], v['D'], v['H'], v['max_weight'],
+                           v['max_value'], v['gravity'], v['cost'])
+                if nb.try_add(it):
+                    open_tier.append(nb)
+                else:
+                    fb = open_bin(it, by_abs)
+                    if fb is None:
+                        return None
+                    open_tier.append(fb)
+        bins.extend(open_tier)
+
+    # Squeeze zero-demand / geometric leftovers into existing spare space.
+    still = []
+    for it in sorted(rest, key=lambda x: -x['vol']):
+        if time.monotonic() > t_end:
+            return None
+        placed = False
+        for b in sorted(bins, key=lambda bb: -bb.rem_vol()):
+            if b.try_add(it):
+                placed = True
+                break
+        if not placed:
+            still.append(it)
+    if still:
+        tail_bins, unp = pack(sorted(still, key=lambda x: -x['vol']), by_abs,
+                              t_end=t_end)
+        if unp:
+            return None
+        bins.extend(tail_bins)
+
+    item_by_id = {it['id']: it for it in items_dicts}
+    for i in range(len(bins)):
+        if time.monotonic() > t_end:
+            break
+        items_in_b = [item_by_id[rec[0]] for rec in bins[i].items]
+        bins[i] = _retype_partial_bin(bins[i], items_in_b, by_abs, t_end)
+    return bins
+
+
 def construct_weight_packed_diverse(items_dicts, vehicles, t_end, rng,
                                     n_primaries=3, n_perturbed=2):
     """
@@ -2048,6 +2575,170 @@ def op_redistribute_then_retype(bins, ilookup, vehicles, rng, t_end):
                     cand.append(b.copy())
             if _cost(cand) < _cost(bins) - 1e-9:
                 return cand, True
+    return bins, False
+
+
+def _bin_binding_fill(b):
+    """Max utilisation across the bin's finite capacities (weight/value/vol)."""
+    f = b.vol_used / max(1.0, b.W * b.D * b.H)
+    if 0.0 < b.max_weight < 1e17:
+        f = max(f, b.weight / b.max_weight)
+    if 0.0 < b.max_value < 1e17:
+        f = max(f, b.value / b.max_value)
+    return f
+
+
+def op_drain_retype(bins, ilookup, vehicles, rng, t_end):
+    """
+    Partially DRAIN an under-filled expensive bin into the slack of ANY other
+    bin (any vehicle type), then retype the drained bin to a cheaper vehicle.
+
+    Fills the gap between op_retype (no draining — the same item set must fit
+    the cheaper vehicle) and op_redistribute_then_retype (receivers restricted
+    to the victim's own vehicle type). The canonical win is a 'tail' bin whose
+    load sits just above a cheaper vehicle's capacity while the rest of the
+    fleet has scattered slack: shed a few items — or, when no single item fits
+    any receiver directly, swap a heavy victim item against a lighter receiver
+    item — until the remainder fits the cheaper vehicle.
+
+    All placements go through Bin3D.try_add / _pack_exact (bounds, overlap,
+    gravity, weight, value all enforced). Strict-improvement only.
+    """
+    n = len(bins)
+    if n < 2:
+        return bins, False
+    by_cost = sorted(vehicles, key=lambda v: v['cost'])
+
+    # Victims: biggest potential saving first = expensive bins with low
+    # binding fill (their load may fit a much cheaper vehicle after a shed).
+    order = sorted(range(n),
+                   key=lambda i: (-bins[i].cost * (1.0 - _bin_binding_fill(bins[i])),))
+    tried = 0
+    for vi in order:
+        if time.monotonic() > t_end:
+            break
+        victim = bins[vi]
+        if not victim.items:
+            continue
+        cheaper = [v for v in by_cost if v['cost'] < victim.cost - 1e-9]
+        if not cheaper:
+            continue
+        tried += 1
+        if tried > 5:
+            break
+
+        receivers = [bins[i].copy() for i in range(n) if i != vi]
+        rem_items = [ilookup[r[0]] for r in victim.items]
+
+        def load_of(it):
+            l = 0.0
+            if 0.0 < victim.max_weight < 1e17:
+                l = max(l, it['weight'] / victim.max_weight)
+            if 0.0 < victim.max_value < 1e17:
+                l = max(l, it['value'] / victim.max_value)
+            return max(l, it['vol'] / max(1.0, victim.W * victim.D * victim.H))
+
+        def recv_slack(rb):
+            s = (rb.max_weight - rb.weight) if rb.max_weight < 1e17 else 0.0
+            if rb.max_value < 1e17:
+                s += (rb.max_value - rb.value)
+            return s
+
+        def try_retype(rem):
+            for v in cheaper:
+                if time.monotonic() > t_end:
+                    return None
+                nb = _pack_exact(rem, v, t_end, rng)
+                if nb is not None:
+                    return nb
+            return None
+
+        moves = 0
+        swaps = 0
+        while moves < 24 and time.monotonic() < t_end and rem_items:
+            # 1) direct move: shed the heaviest-load item that fits somewhere.
+            rem_items.sort(key=lambda it: -load_of(it))
+            moved = None
+            for it in rem_items:
+                if time.monotonic() > t_end:
+                    break
+                # best-fit: tightest receiver slack first, keeps big slack free
+                for rb in sorted(receivers, key=recv_slack):
+                    if rb.try_add(it):
+                        moved = it
+                        break
+                if moved is not None:
+                    break
+            if moved is not None:
+                rem_items.remove(moved)
+                moves += 1
+            else:
+                # 2) swap fallback: trade a heavy victim item for a lighter
+                #    receiver item, strictly reducing the victim's load.
+                if swaps >= 16:
+                    break
+                swaps += 1
+                done_swap = False
+                # Roomiest receivers first: the larger the slack, the smaller
+                # the item we may take back — maximises net shed per swap.
+                recv_order = sorted(range(len(receivers)),
+                                    key=lambda ri: -recv_slack(receivers[ri]))
+                for it_out in rem_items[:3]:
+                    if time.monotonic() > t_end:
+                        break
+                    for ri in recv_order:
+                        rb = receivers[ri]
+                        if not rb.items:
+                            continue
+                        slack_w = rb.max_weight - rb.weight
+                        slack_v = (rb.max_value - rb.value) if rb.max_value < 1e17 else float('inf')
+                        # smallest-load receiver item that makes room for it_out
+                        cand_in = None
+                        for rec in rb.items:
+                            it_in = ilookup[rec[0]]
+                            if it_in['weight'] + it_in['value'] >= it_out['weight'] + it_out['value'] - 1e-9:
+                                continue
+                            if it_out['weight'] > slack_w + it_in['weight'] + 1e-9:
+                                continue
+                            if it_out['value'] > slack_v + it_in['value'] + 1e-9:
+                                continue
+                            if cand_in is None or (it_in['weight'] + it_in['value'] <
+                                                   cand_in['weight'] + cand_in['value']):
+                                cand_in = it_in
+                        if cand_in is None:
+                            continue
+                        # rebuild receiver without cand_in, then add it_out
+                        nb = Bin3D(rb.vtype, rb.W, rb.D, rb.H, rb.max_weight,
+                                   rb.max_value, rb.gravity, rb.cost)
+                        ok = True
+                        for rec in rb.items:
+                            if rec[0] == cand_in['id']:
+                                continue
+                            if not nb.try_add(ilookup[rec[0]]):
+                                ok = False
+                                break
+                        if not ok or not nb.try_add(it_out):
+                            continue
+                        receivers[ri] = nb
+                        rem_items.remove(it_out)
+                        rem_items.append(cand_in)
+                        moves += 1
+                        done_swap = True
+                        break
+                    if done_swap:
+                        break
+                if not done_swap:
+                    break
+            if not rem_items:
+                cand = receivers
+                if _cost(cand) < _cost(bins) - 1e-9:
+                    return cand, True
+                break
+            nb = try_retype(rem_items)
+            if nb is not None and nb.cost < victim.cost - 1e-9:
+                cand = receivers + [nb]
+                if _cost(cand) < _cost(bins) - 1e-9:
+                    return cand, True
     return bins, False
 
 
@@ -3025,6 +3716,100 @@ def generate_columns_pair_seeded(items, vehicles, n_cols, rng, t_end):
             break
     return out
 
+
+def generate_columns_resource_knapsack(items, vehicles, rng, t_end, n_cols=400):
+    """
+    Tight-fill 'knapsack' columns for resource-bound fleets.
+
+    For the vehicle types that are most cost-efficient per unit of each
+    ACTIVE finite resource (weight and/or value — instance-driven via
+    _active_resources), build bins that fill the binding resource as close
+    to the cap as possible: seed with the largest unused item, then top up
+    first-fit with the largest complementary items that still fit (caps and
+    geometry enforced by try_add). Several jittered sweeps produce diverse,
+    overlapping pair/triple columns — exactly the building blocks the
+    set-partition MILP needs on weight- or value-bound instances, which the
+    EP/GRASP pipeline rarely emits.
+    """
+    out = []
+    if len(items) < 2:
+        return out
+    res, _tot = _active_resources(items, vehicles)
+    res = [r for r in res if r in ('weight', 'value')]
+    if not res:
+        return out
+
+    cand_vehicles = []
+    seen_types = set()
+    for r in res:
+        key = (lambda v: v['max_weight']) if r == 'weight' else (lambda v: v['max_value'])
+        vs = [v for v in vehicles if 0.0 < key(v) < 1e17]
+        vs.sort(key=lambda v: v['cost'] / key(v))
+        for v in vs[:3]:
+            if v['type'] not in seen_types:
+                seen_types.add(v['type'])
+                cand_vehicles.append(v)
+    if not cand_vehicles:
+        return out
+
+    per_v = max(40, n_cols // len(cand_vehicles))
+    for v in cand_vehicles:
+        if time.monotonic() > t_end:
+            break
+        capw, capv = v['max_weight'], v['max_value']
+
+        def share(it):
+            s = 0.0
+            if 0.0 < capw < 1e17:
+                s = max(s, it['weight'] / capw)
+            if 0.0 < capv < 1e17:
+                s = max(s, it['value'] / capv)
+            return s
+
+        pool_items = [it for it in items
+                      if share(it) > 1e-9 and _vehicle_accepts_item(it, v)]
+        if not pool_items:
+            continue
+        # If even the most demanding item uses <5% of this vehicle's caps,
+        # weight/value never bind here (geometry does) — knapsack columns
+        # would just duplicate FFD work. Skip.
+        if max(share(it) for it in pool_items) < 0.05:
+            continue
+
+        made = 0
+        for sweep in range(3):
+            if made >= per_v or time.monotonic() > t_end:
+                break
+            order = list(pool_items)
+            if sweep == 0:
+                order.sort(key=lambda it: -share(it))
+            else:
+                order.sort(key=lambda it: -(share(it) * rng.uniform(0.80, 1.20)))
+            used = set()
+            for si, seed in enumerate(order):
+                if made >= per_v or time.monotonic() > t_end:
+                    break
+                if seed['id'] in used:
+                    continue
+                b = Bin3D(v['type'], v['W'], v['D'], v['H'],
+                          v['max_weight'], v['max_value'], v['gravity'], v['cost'])
+                if not b.try_add(seed):
+                    used.add(seed['id'])
+                    continue
+                used.add(seed['id'])
+                for it in order[si + 1:]:
+                    if it['id'] in used:
+                        continue
+                    if not b.cap_ok(it['weight'], it['value']):
+                        continue
+                    if b.try_add(it):
+                        used.add(it['id'])
+                if len(b.items) >= 2:
+                    out.append(b)
+                    made += 1
+    return out
+
+
 def path_relinking(incumbent, pool, ilookup, vehicles, t_end, rng):
     """
     Path Relinking from column pool to incumbent.
@@ -3465,6 +4250,10 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                 bins = construct_vector_packed(items, vehicles, t_p1)
             elif mode == 'layered':
                 bins = construct_layered(items, vehicles, t_p1)
+            elif mode == 'towers':
+                bins = construct_towers(items, vehicles, t_p1, pool=pool)
+            elif mode == 'knap':
+                bins = construct_knapsack_packed(items, vehicles, t_p1)
             else:
                 return label, None, float('inf')
             if bins is None:
@@ -3504,6 +4293,8 @@ class solver_364130_354977_356856_359530(AbstractSolver):
             ('v-pack',   'volume',  seed0 + 51),
             ('vec-pack', 'vector',  seed0 + 52),
             ('lay-pack', 'layered', seed0 + 53),
+            ('twr-pack', 'towers',  seed0 + 54),
+            ('knap-pack', 'knap',   seed0 + 55),
         ]
 
         with ThreadPoolExecutor(max_workers=self.N_THREADS) as ex:
@@ -3650,6 +4441,22 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                         f"cost={_cost(xb):.2f}")
             except Exception as e:
                 log(f"  vector-packed seed failed: {e}")
+            try:
+                kb = construct_knapsack_packed(items, vehicles, t_seed_end)
+                if kb:
+                    pool.add_solution(kb)
+                    log(f"  Pre-seed knapsack-packed: {len(kb)} bins, "
+                        f"cost={_cost(kb):.2f}")
+            except Exception as e:
+                log(f"  knapsack-packed seed failed: {e}")
+            try:
+                tb = construct_towers(items, vehicles, t_seed_end, pool=pool)
+                if tb:
+                    pool.add_solution(tb)
+                    log(f"  Pre-seed towers: {len(tb)} bins, "
+                        f"cost={_cost(tb):.2f}")
+            except Exception as e:
+                log(f"  towers seed failed: {e}")
 
         # Diversified pre-seed: weight-FFD with top-3 CPW primaries plus a
         # cost-perturbed primary pick. The standard pre-seed only uses the
@@ -3683,6 +4490,19 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                 items, vehicle_cycle[vi], n_pair, rng_cg, t_cg_pair_split
             ):
                 pool.add_bin(b)
+
+        # Knapsack-fill columns: tight pair/triple columns on the most
+        # cost-efficient vehicle classes (no-op on fleets with no finite
+        # weight/value caps — see _active_resources).
+        t_cg_knap = min(time.monotonic() + 6.0, t_cg_total)
+        try:
+            for b in generate_columns_resource_knapsack(
+                items, vehicles_all, rng_cg, t_cg_knap,
+                n_cols=max(120, len(items) // 2),
+            ):
+                pool.add_bin(b)
+        except Exception as e:
+            log(f"  knapsack CG failed: {e}")
 
         # Item-centric columns on the remaining budget
         for i, item in enumerate(sorted(items, key=lambda x: -x['vol'])):

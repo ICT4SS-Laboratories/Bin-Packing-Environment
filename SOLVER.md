@@ -110,6 +110,21 @@ This is a **generic, data-driven** robustness switch, not dataset tuning.
   its cheapest viable vehicle:
   - `construct_weight_packed` — weight-binding instances (LPT distribution).
   - `construct_volume_packed` — volume-binding instances.
+  - **`construct_knapsack_packed`** — tight-fill FFD for resource-bound
+    fleets: routes each item to the vehicle type cheapest *per unit of the
+    item's binding resource* among those that accept it (two-tier structure
+    emerges automatically, e.g. light/low-value items into the small efficient
+    vehicle, the rest into the next class), packs each tier first-fit in
+    descending binding share, squeezes zero-demand items into spare geometry.
+  - **`construct_towers`** — tower/shelf constructor: groups identical-dims
+    items, stacks them into full-support towers (identical footprints ⇒ 100%
+    support ⇒ valid at any gravityStrength) and shelf-packs the floor; tries
+    3 height policies × 2 shelf openers × top-2 primaries, feeding ALL covers
+    to the column pool. On repeated-shape instances it additionally mines the
+    per-bin **patterns** (group-count vectors + placement templates) and solves
+    a small cutting-stock cover IP (`scipy.milp`) so mono-type and mixed
+    patterns from different runs can be combined — greedy runs alone partition
+    the items and the set-partition MILP could never mix them.
   - **`construct_vector_packed`** — generic multi-resource constructor. It fills
     the gap left by the two above: when weight **and/or value** (and volume)
     bind together, it balances all *active* (finite-cap, non-zero-demand)
@@ -134,7 +149,20 @@ On stagnation it escalates "ruin-and-recreate" kicks (VNS). It always returns th
 `op_relocate`, `op_retype` / `op_retype_all` (downsize containers),
 `op_shake`, `op_merge3`, `op_eject`, `op_swap_pair`, `op_consolidate_pair`
 (merge two bins into one cheaper bin), `op_ruin_recreate` (+ a stronger variant),
-`op_weight_pair_repack`, `op_bin_split`, `op_redistribute_then_retype`.
+`op_weight_pair_repack` (pairs on the *binding* normalised resource — weight
+or value), `op_bin_split`, `op_redistribute_then_retype`, and
+**`op_drain_retype`**: partially drains an under-filled expensive bin into the
+slack of ANY other bin (cross-type receivers; falls back to load-reducing
+item swaps when no direct move fits), then retypes the drained bin to a
+cheaper vehicle. This captures 'tail' bins whose load sits just above a
+cheaper vehicle's capacity — e.g. on DatasetI it turns the V5 tail into a V6
+(−785.45) where retype/redistribute alone can never fire.
+
+`op_eject` / `op_swap_pair` re-pack bins item-by-item; both now verify every
+`try_add` (a failed re-add used to silently DROP the item — the cost looked
+lower, `update_best` accepted it, and the end-of-run repair re-opened a fresh
+bin for it, a net loss). `op_swap_pair` also works on a copy per swap
+candidate so a half-applied swap can't duplicate an item across two bins.
 
 ---
 
@@ -145,6 +173,12 @@ On stagnation it escalates "ruin-and-recreate" kicks (VNS). It always returns th
 - Targeted generators add structurally diverse columns: per-item, pair-seeded,
   cost-targeted (repack expensive bins into cheaper vehicles), dual-guided, and
   shadow-mode Dantzig–Wolfe cycles (committed only if they actually help).
+- **`generate_columns_resource_knapsack`**: for the vehicle types most
+  cost-efficient per unit of each active finite resource, builds bins filled
+  as close to the binding cap as possible (largest seed + largest
+  complementary top-ups, jittered sweeps). Supplies the tight pair/triple
+  columns the MILP needs on weight-/value-bound instances; skips vehicles
+  where no item uses ≥5% of the caps (geometry-bound — nothing to gain).
 - `solve_set_partition` runs an exact **MILP** (HiGHS, fallback CP-SAT / SciPy)
   that selects the cheapest subset of columns covering every item exactly,
   warm-started with the incumbent. The pool is LP-filtered down to a column cap
