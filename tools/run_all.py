@@ -4,10 +4,9 @@ Convenience runner: solve a list of datasets back-to-back with solver_364130_354
 without touching the graded main.py. Each dataset uses the full time budget
 (env SOLVER_364130_TIME_LIMIT, default 600s) and writes results/sol_*.csv.
 
-KEEP-BEST: the solver always writes its own fresh CSV (every result on disk
-is a genuine solver output), but after each dataset this runner compares the
-new CSV against the previous one and puts back whichever is cheaper AND
-feasible — a worse run can no longer overwrite a better stored solution.
+ALWAYS-OVERWRITE: the CSV on disk is ALWAYS the output of the latest run —
+this runner never restores a previous file. After each dataset it only
+PRINTS a comparison against the previous cost so regressions are visible.
 
 SEED ROTATION: each invocation uses a different solver BASE_SEED (derived
 from the current time). The solver's deep-LNS trajectory is seed-driven, so
@@ -121,11 +120,7 @@ if __name__ == '__main__':
 
     print(f"Running {len(dsets)} dataset(s): {', '.join(dsets)}")
     for ds in dsets:
-        sol_path = os.path.join('results', f'sol_{ds}_{SOLVER}.csv')
-        keep_path = sol_path + '.prev'
         prev_cost = cost_if_feasible(ds)
-        if prev_cost is not None:
-            shutil.copyfile(sol_path, keep_path)
 
         t0 = time.monotonic()
         inst = Instance(ds)
@@ -134,16 +129,15 @@ if __name__ == '__main__':
         solver.solve()
         print(f">>> {ds} done in {time.monotonic() - t0:.0f}s")
 
-        # Keep-best: restore the previous CSV when the new run is worse.
+        # Informative comparison only — the new CSV ALWAYS stays on disk.
         new_cost = cost_if_feasible(ds)
-        if prev_cost is not None:
-            if new_cost is None or new_cost > prev_cost + 1e-9:
-                shutil.copyfile(keep_path, sol_path)
-                new_str = f"{new_cost:,.2f}" if new_cost is not None else "INFEASIBLE"
-                print(f">>> {ds}: run gave {new_str} — kept previous best "
-                      f"{prev_cost:,.2f}")
-            elif new_cost < prev_cost - 1e-9:
-                print(f">>> {ds}: improved {prev_cost:,.2f} → {new_cost:,.2f}")
-            os.remove(keep_path)
+        new_str = f"{new_cost:,.2f}" if new_cost is not None else "INFEASIBLE"
+        if prev_cost is not None and new_cost is not None:
+            delta = new_cost - prev_cost
+            tag = ("improved" if delta < -1e-9
+                   else ("worse" if delta > 1e-9 else "same"))
+            print(f">>> {ds}: {new_str}  (previous {prev_cost:,.2f}, {tag})")
+        else:
+            print(f">>> {ds}: {new_str}")
     print("\nAll done. Verify with:  python tools/eval_solutions.py "
           + ' '.join(args))

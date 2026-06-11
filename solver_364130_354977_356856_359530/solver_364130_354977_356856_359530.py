@@ -616,6 +616,20 @@ def _enforce_checker_feasible(rows, ilookup, vehicles, veh_by_type):
                     return False
             return True
 
+        # Weight/value caps first (the geometric loop below can't see them):
+        # evict the heaviest-share boxes until the bin is within caps.
+        def _over_caps():
+            tw = sum(ilookup[bx[i][0]['id_item']]['weight']
+                     for i in range(len(bx)) if keep[i])
+            tv = sum(ilookup[bx[i][0]['id_item']]['value']
+                     for i in range(len(bx)) if keep[i])
+            return (tw > v['max_weight'] + 1e-9 or
+                    tv > v['max_value'] + 1e-9)
+        while any(keep) and _over_caps():
+            worst = max((i for i in range(len(bx)) if keep[i]),
+                        key=lambda i: (ilookup[bx[i][0]['id_item']]['weight'] +
+                                       ilookup[bx[i][0]['id_item']]['value']))
+            keep[worst] = False
         changed = True
         while changed:
             changed = False
@@ -643,6 +657,65 @@ def _enforce_checker_feasible(rows, ilookup, vehicles, veh_by_type):
                              'z_origin': z, 'orient': int(orient)})
         next_idx += 1
     return out_rows, len(exploded)
+
+def _validate_solution_exact(bins, ilookup):
+    """
+    Strict official-checker replica over INTERNAL bins: duplicates, bounds,
+    overlap, weight/value caps, gravity. Returns None when feasible, else a
+    short reason. update_best uses it (on exact-arithmetic instances) to
+    REFUSE corrupt candidates — a cost-only acceptance once let an invalid
+    solution become the incumbent and reach the output, which in the graded
+    one-run-per-dataset scenario means zero points for that instance.
+    """
+    seen = set()
+    for b in bins:
+        tw = tv = 0.0
+        boxes = b.items
+        for k, (iid, x, y, z, iw, id_, ih, rot) in enumerate(boxes):
+            if iid in seen:
+                return f'duplicate item {iid}'
+            seen.add(iid)
+            it = ilookup.get(iid)
+            if it is None:
+                return f'unknown item {iid}'
+            tw += it['weight']
+            tv += it['value']
+            if (x < -1e-9 or y < -1e-9 or z < -1e-9
+                    or x + iw > b.W + 1e-9
+                    or y + id_ > b.D + 1e-9
+                    or z + ih > b.H + 1e-9):
+                return f'bounds {iid}'
+            for j in range(k):
+                (iid2, x2, y2, z2, iw2, id2, ih2, _r2) = boxes[j]
+                if (max(x, x2) < min(x + iw, x2 + iw2) and
+                        max(y, y2) < min(y + id_, y2 + id2) and
+                        max(z, z2) < min(z + ih, z2 + ih2)):
+                    return f'overlap {iid}/{iid2}'
+        if tw > b.max_weight + 1e-6:
+            return f'weight cap {b.vtype}'
+        if tv > b.max_value + 1e-6:
+            return f'value cap {b.vtype}'
+        if b.gravity > 1e-9:
+            for (iid, x, y, z, iw, id_, ih, rot) in boxes:
+                if z <= 1e-12:
+                    continue
+                need = (iw * id_) * (b.gravity / 100.0)
+                sup = 0.0
+                for (iid2, x2, y2, z2, iw2, id2, ih2, _r2) in boxes:
+                    if iid2 == iid:
+                        continue
+                    if abs((z2 + ih2) - z) < 1e-6:
+                        dx = min(x + iw, x2 + iw2) - max(x, x2)
+                        if dx <= 0:
+                            continue
+                        dy = min(y + id_, y2 + id2) - max(y, y2)
+                        if dy <= 0:
+                            continue
+                        sup += dx * dy
+                if sup < need - 1e-9:
+                    return f'gravity {iid}'
+    return None
+
 
 def _repack(to_place, existing, vehicles, t_end):
     """Try to fit *to_place* into *existing* (already copied). Returns (bins, success)."""
@@ -1458,6 +1531,25 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
     destroy_rate=0.33
     elim_failures=0
 
+    # Per-move feasibility audit (exact-arithmetic instances only): a corrupt
+    # operator result must not become the working solution NOR reach the
+    # column pool. Rejecting at move level keeps the search alive and the
+    # log line names the culprit operator.
+    n_items0 = sum(len(b.items) for b in cur)
+    exact_audit = (_SAFE == 0.0)
+
+    def _move_ok(cand_bins, op_name):
+        if not exact_audit:
+            return True
+        if sum(len(b.items) for b in cand_bins) != n_items0:
+            print(f'    ✗ [{op_name}] corrupt move rejected: item count changed')
+            return False
+        reason = _validate_solution_exact(cand_bins, ilookup)
+        if reason is not None:
+            print(f'    ✗ [{op_name}] corrupt move rejected: {reason}')
+            return False
+        return True
+
     # Mutable state for closures
     state = {'destroy_rate': destroy_rate}
 
@@ -1504,6 +1596,8 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
     while time.monotonic() < t_end:
         # Always try elim first.
         new, ok = op_elim(cur, ilookup, vehicles, t_end)
+        if ok and not _move_ok(new, 'ELIM'):
+            ok = False
         if ok:
             cur = new; stag = 0
             state['destroy_rate'] = max(0.25, state['destroy_rate'] * 0.85)
@@ -1536,6 +1630,8 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
                 break
         op_name, op_fn = sec_ops[choice]
         new, ok = op_fn(cur)
+        if ok and not _move_ok(new, op_name):
+            ok = False
         if ok:
             cur = new; stag = 0
             state['destroy_rate'] = max(0.25,
@@ -1562,6 +1658,8 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
                     ruin_frac=vns_levels[vns_idx]
                 )
                 vns_idx += 1
+                if kok and not _move_ok(kicked, 'VNS-KICK'):
+                    kok = False
                 if kok:
                     cur = kicked
                     if pool: pool.add_solution(cur)
@@ -1591,6 +1689,8 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
     """
     cur = [b.copy() for b in bins]
     rng = random.Random(987654321)
+    n_items0 = sum(len(b.items) for b in cur)
+    exact_audit = (_SAFE == 0.0)
     while time.monotonic() < t_end:
         imp = False
         for op in (
@@ -1610,6 +1710,15 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
         ):
             new, ok = op(cur)
             if ok and _cost(new) < _cost(cur) - 1e-9:
+                # Per-move feasibility audit (see lns) — never let a corrupt
+                # move into the final polished solution or the pool.
+                if exact_audit:
+                    if sum(len(b.items) for b in new) != n_items0 \
+                            or _validate_solution_exact(new, ilookup) is not None:
+                        print('    ✗ [POST-OPT] corrupt move rejected')
+                        if time.monotonic() >= t_end:
+                            break
+                        continue
                 cur = new
                 imp = True
                 if pool:
@@ -4598,6 +4707,21 @@ class solver_364130_354977_356856_359530(AbstractSolver):
         def update_best(bins, label=''):
             c = _cost(bins)
             with lock:
+                if c >= best_cost[0] - 1e-9:
+                    return False
+            # Exact feasibility audit before acceptance (integer instances —
+            # exact arithmetic, so any violation is real corruption, not
+            # float noise). Rejecting here keeps a corrupt candidate from
+            # ever becoming the incumbent AND names the culprit operator.
+            if not non_integer:
+                reason = _validate_solution_exact(bins, ilookup)
+                if reason is None \
+                        and sum(len(b.items) for b in bins) != len(all_ids):
+                    reason = 'missing items'
+                if reason is not None:
+                    log(f'    ✗ REJECTED corrupt candidate ({label}): {reason}')
+                    return False
+            with lock:
                 if c < best_cost[0] - 1e-9:
                     best_cost[0] = c
                     best_bins[0] = [b.copy() for b in bins]
@@ -5346,11 +5470,13 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                     seen.add(iid2)
                 idx_v += 1
 
-        # Final safety net (non-integer instances): replay the assembled output
+        # Final safety net (ALL instances): replay the assembled output
         # through a literal checker and split any rejected box into its own floor
         # bin — guarantees the written CSV is feasible regardless of any gap in
-        # the per-bin repair.
-        if non_integer and rows:
+        # the per-bin repair. (Was non-integer-only; an integer-instance run once
+        # emitted an infeasible CSV — in the graded single-run scenario that is
+        # an automatic zero, so the net now always runs.)
+        if rows:
             veh_by_type = {v['type']: v for v in vehicles_all}
             rows, n_split = _enforce_checker_feasible(rows, ilookup, vehicles, veh_by_type)
             if n_split:
