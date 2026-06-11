@@ -117,6 +117,15 @@ if __name__ == '__main__':
             best_cost = existing
             shutil.copyfile(best_path, keep_path)
         for k in range(N):
+            # Seed rotation: the deep-LNS trajectory is seed-driven, so
+            # re-running with the same seed converges to the same local
+            # optimum. A different BASE_SEED per run is what makes
+            # best-of-N actually explore different basins.
+            if 'SOLVER_364130_SEED' not in os.environ:
+                import time as _t
+                solver_364130_354977_356856_359530.BASE_SEED = (
+                    (int(_t.time()) % 100000) + k * 1009 + 17
+                )
             inst = Instance(ds)
             solver = solver_364130_354977_356856_359530(inst)
             solver.solve()  # writes results/sol_<ds>_solver_364130.csv

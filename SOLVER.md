@@ -119,8 +119,11 @@ This is a **generic, data-driven** robustness switch, not dataset tuning.
   - **`construct_towers`** — tower/shelf constructor: groups identical-dims
     items, stacks them into full-support towers (identical footprints ⇒ 100%
     support ⇒ valid at any gravityStrength) and shelf-packs the floor; tries
-    3 height policies × 2 shelf openers × top-2 primaries, feeding ALL covers
-    to the column pool. On repeated-shape instances it additionally mines the
+    3 height policies × 2 shelf openers × mixed-tower top-up on/off × top-2
+    primaries, feeding ALL covers to the column pool. The top-up continues a
+    finished tower with items of OTHER groups whose footprint fits inside the
+    current top face (support stays 100%), recovering the height a
+    single-type tower wastes. On repeated-shape instances it additionally mines the
     per-bin **patterns** (group-count vectors + placement templates) and solves
     a small cutting-stock cover IP (`scipy.milp`) so mono-type and mixed
     patterns from different runs can be combined — greedy runs alone partition
@@ -154,9 +157,14 @@ or value), `op_bin_split`, `op_redistribute_then_retype`, and
 **`op_drain_retype`**: partially drains an under-filled expensive bin into the
 slack of ANY other bin (cross-type receivers; falls back to load-reducing
 item swaps when no direct move fits), then retypes the drained bin to a
-cheaper vehicle. This captures 'tail' bins whose load sits just above a
-cheaper vehicle's capacity — e.g. on DatasetI it turns the V5 tail into a V6
-(−785.45) where retype/redistribute alone can never fire.
+cheaper vehicle. Victims are ranked by ACHIEVABLE saving (cheapest vehicle
+reachable within the fleet's aggregate slack), and draining continues past
+the first feasible retype to the best one — e.g. on DatasetI it walks the
+tail V5 → V6 → V7 (−1,412.93 total) where retype/redistribute alone can
+never fire. **`op_elim_repack`** complements `op_elim` on volume-bound
+fleets: when an evicted item doesn't fit a receiver incrementally, the
+receiver is re-packed from scratch together with it (defragmentation),
+bounded by a fixed number of deep repacks.
 
 `op_eject` / `op_swap_pair` re-pack bins item-by-item; both now verify every
 `try_add` (a failed re-add used to silently DROP the item — the cost looked
@@ -194,6 +202,36 @@ candidate so a half-applied swap can't duplicate an item across two bins.
   warm-started with the incumbent. The pool is LP-filtered down to a column cap
   before solving. The MILP can only pick a subset — it never invents placements —
   so it is always followed by a polish pass.
+- **Robustness invariants** (each one fixed an observed real failure):
+  the incumbent's own columns are ALWAYS appended to the MILP input
+  (`cols_with_incumbent` — pool eviction under saturation once made the
+  set-partition infeasible); pool eviction is by worst **cost-per-item**, not
+  absolute cost (evicting expensive columns anti-selects the big vehicles
+  volume-bound fleets need); GRASP restart harvesting is gated to ≤1.25× the
+  incumbent (unbounded harvest saturated the pool with junk); the MIP start
+  is the incumbent ALONE as a dense 0/1 vector and the warm cover is also kept
+  as a candidate; and `_cover_postprocess` PRESERVES each selected column's
+  discovered geometry (re-packing through EP try_add cannot reproduce
+  tower/pattern placements — the old unconditional re-pack spilled their items
+  into extra bins and deterministically inflated every MILP solution that
+  selected such columns).
+- The same geometry-preservation principle runs through the whole pipeline:
+  `_bin_minus_items` (item removal keeping original coordinates + support
+  re-check) keeps tower incumbents EDITABLE by `op_eject` / `op_swap_pair` /
+  `op_ruin_recreate`, and `_retype_partial_bin` first tries a **geometry
+  transplant** (same coordinates into a smaller vehicle whose dims contain the
+  placed extents, support re-verified against the new gravityStrength) before
+  falling back to an EP re-pack — this is the only retype that works on tower
+  bins and routinely converts several of them to cheaper vehicle types.
+- **Single-run robustness** (the graded scenario is ONE run per dataset):
+  the deep-LNS worker re-attacks the incumbent with fresh random streams when
+  `lns()` returns on stagnation (one stagnation no longer wastes the rest of
+  Phase 2); GRASP restart workers carry a futility switch — after 40
+  consecutive restarts without a global improvement they convert themselves
+  into extra parallel LNS attackers on the shared incumbent (on constructor-
+  basin instances hundreds of restarts used to burn 3 of 4 threads for
+  nothing); tower bins get an EP top-up pass (leftover shelf strips filled
+  with any remaining items, tried as a with/without variant per build).
 
 ---
 

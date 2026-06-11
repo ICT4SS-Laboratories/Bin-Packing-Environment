@@ -360,7 +360,10 @@ class ColumnPool:
     # Hard cap: once we have many columns, only add if they look promising.
     # Pool is filtered down to MILP cap before solving, so a richer pool only
     # costs memory + LP-filter time, never MILP solve time directly.
-    _MAX_POOL = 10000
+    # 16k (was 10k): resource-bound instances produce 300-600 bins per cover,
+    # so a handful of Phase-1 covers used to saturate the pool before Phase 2
+    # even started, forcing heavy eviction churn.
+    _MAX_POOL = 16000
 
     def add_bin(self, b: Bin3D):
         key = frozenset(r[0] for r in b.items)
@@ -379,9 +382,18 @@ class ColumnPool:
                 self._cols.append(cand)
                 return
 
-            # Full pool: replace the most expensive column only if improved.
-            worst_idx = max(range(len(self._cols)), key=lambda i: self._cols[i].cost)
-            if cand.cost >= self._cols[worst_idx].cost - 1e-9:
+            # Full pool: evict by worst COST-PER-ITEM, not absolute cost.
+            # Evicting the most expensive column anti-selects on volume-bound
+            # fleets, where the useful columns are exactly the big expensive
+            # vehicles packed full (e.g. 50 items in a 1500-cost container =
+            # 30/item) while the junk is a cheap container holding one item
+            # (650-cost singleton = 650/item). Saturation once evicted the
+            # incumbent's own columns and made the set-partition INFEASIBLE.
+            def _cpi(b):
+                return b.cost / max(1, len(b.items))
+            worst_idx = max(range(len(self._cols)),
+                            key=lambda i: _cpi(self._cols[i]))
+            if _cpi(cand) >= _cpi(self._cols[worst_idx]) - 1e-12:
                 return
 
             old_key = frozenset(r[0] for r in self._cols[worst_idx].items)
@@ -646,6 +658,30 @@ def _repack(to_place, existing, vehicles, t_end):
             else:  return work, False
     return work, _cost(work)<=_cost(existing)+1e-9
 
+def _bin_minus_items(b, remove_ids, ilookup):
+    """
+    Rebuild *b* WITHOUT *remove_ids*, preserving original coordinates.
+
+    Removing boxes can only break the gravity of boxes above them (bounds,
+    overlap and caps are monotone under removal), so re-verify support for
+    every kept box and return None when a stack loses its base — the caller
+    then falls back to an EP re-pack or skips the move. This keeps
+    direct-placement (tower / pattern) bins EDITABLE by the LNS operators:
+    an EP try_add re-pack cannot reproduce those geometries, which used to
+    freeze tower incumbents for the whole improvement phase.
+    """
+    keep = [rec for rec in b.items if rec[0] not in remove_ids]
+    nb = Bin3D(b.vtype, b.W, b.D, b.H, b.max_weight, b.max_value,
+               b.gravity, b.cost)
+    for (iid, x, y, z, iw, id_, ih, rot) in keep:
+        it = ilookup[iid]
+        nb.place(iid, x, y, z, iw, id_, ih, rot, it['weight'], it['value'])
+    for (iid, x, y, z, iw, id_, ih, rot) in keep:
+        if z > 1e-9 and not nb._grav_ok(x, y, z, iw, id_, ih):
+            return None
+    return nb
+
+
 def op_elim(bins, ilookup, vehicles, t_end):
     if len(bins)<=1: return bins,False
     order=sorted(range(len(bins)),key=lambda i:len(bins[i].items))
@@ -656,6 +692,75 @@ def op_elim(bins, ilookup, vehicles, t_end):
         new,ok=_repack(to_move,others,vehicles,t_end)
         if ok and _cost(new)<_cost(bins)-1e-9: return new,True
     return bins,False
+
+def op_elim_repack(bins, ilookup, vehicles, rng, t_end, max_deep=40):
+    """
+    Bin elimination with RECEIVER REPACK — the volume-bound complement of
+    op_elim. op_elim relocates the victim's items via incremental try_add,
+    which dies on geometric fragmentation even when the fleet's total
+    residual volume far exceeds the victim's content (e.g. 24 bins at 87%
+    fill hold 3+ bins of free space, all in unusable slivers). Here, when an
+    item doesn't fit a receiver incrementally, the receiver is re-packed
+    FROM SCRATCH together with that item (_pack_exact, multiple orderings) —
+    defragmenting the bin on the fly. Bounded by max_deep full repacks.
+    Strict-improvement only.
+    """
+    n = len(bins)
+    if n < 2:
+        return bins, False
+    vmap = {v['type']: v for v in vehicles}
+    # Victims: lowest binding fill first — cheapest content to disperse.
+    order = sorted(range(n), key=lambda i: _bin_binding_fill(bins[i]))
+    for vi in order[:3]:
+        if time.monotonic() > t_end:
+            break
+        victim = bins[vi]
+        if not victim.items:
+            continue
+        rem = sorted((ilookup[r[0]] for r in victim.items),
+                     key=lambda it: -it['vol'])
+        receivers = [bins[i].copy() for i in range(n) if i != vi]
+        deep_used = 0
+        ok_all = True
+        for it in rem:
+            if time.monotonic() > t_end:
+                ok_all = False
+                break
+            placed = False
+            ridx = sorted(range(len(receivers)),
+                          key=lambda j: -receivers[j].rem_vol())
+            # fast path: incremental insert anywhere
+            for j in ridx:
+                if receivers[j].try_add(it):
+                    placed = True
+                    break
+            if not placed:
+                # deep path: full receiver repack (largest residuals first)
+                for j in ridx[:6]:
+                    if deep_used >= max_deep or time.monotonic() > t_end:
+                        break
+                    rb = receivers[j]
+                    if not rb.cap_ok(it['weight'], it['value']):
+                        continue
+                    if rb.vol_used + it['vol'] > rb.W * rb.D * rb.H + 1e-9:
+                        continue
+                    v = vmap.get(rb.vtype)
+                    if v is None:
+                        continue
+                    deep_used += 1
+                    items_r = [ilookup[r[0]] for r in rb.items] + [it]
+                    nb = _pack_exact(items_r, v, t_end, rng)
+                    if nb is not None:
+                        receivers[j] = nb
+                        placed = True
+                        break
+            if not placed:
+                ok_all = False
+                break
+        if ok_all and _cost(receivers) < _cost(bins) - 1e-9:
+            return receivers, True
+    return bins, False
+
 
 def op_shake(bins, ilookup, vehicles, rng, t_end):
     if len(bins)<2: return bins,False
@@ -679,15 +784,19 @@ def op_eject(bins, ilookup, vehicles, rng, t_end, destroy_rate=0.33):
     eject_recs=rng.sample(b.items,min(n,len(b.items)))
     eject_ids={r[0] for r in eject_recs}
     eject_items=[ilookup[r[0]] for r in eject_recs]
-    src=Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
-    for rec in b.items:
-        if rec[0] not in eject_ids:
-            # Re-packing the kept items is order-dependent; if one no longer
-            # fits, the item would silently VANISH from the solution (cost
-            # looks lower, update_best accepts, final repair re-adds it in a
-            # fresh bin — a net loss). Abort instead.
-            if not src.try_add(ilookup[rec[0]]):
-                return bins,False
+    # Preserve original geometry (towers stay editable); fall back to an EP
+    # re-pack only when the removal breaks a supported stack.
+    src = _bin_minus_items(b, eject_ids, ilookup)
+    if src is None:
+        src=Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
+        for rec in b.items:
+            if rec[0] not in eject_ids:
+                # Re-packing the kept items is order-dependent; if one no
+                # longer fits, the item would silently VANISH from the
+                # solution (cost looks lower, update_best accepts, final
+                # repair re-adds it in a fresh bin — a net loss). Abort.
+                if not src.try_add(ilookup[rec[0]]):
+                    return bins,False
     work=[bins[i].copy() for i in range(len(bins)) if i!=bi]
     work.insert(bi,src)
     others=[work[i] for i in range(len(work)) if i!=bi]
@@ -760,32 +869,37 @@ def op_swap_pair(bins, ilookup, vehicles, rng, t_end):
             rb_pool = rng.sample(b.items, min(6, len(b.items)))
             for ra in ra_pool:
                 ia = ilookup[ra[0]]
-                a_new = Bin3D(a.vtype,a.W,a.D,a.H,a.max_weight,a.max_value,a.gravity,a.cost)
-                # Re-pack is order-dependent: a failed try_add would silently
-                # DROP the item from the solution. Discard this candidate.
-                a_ok = True
-                for r2 in a.items:
-                    if r2[0] != ra[0]:
-                        if not a_new.try_add(ilookup[r2[0]]):
-                            a_ok = False
-                            break
-                if not a_ok:
-                    continue
+                # Geometry-preserving removal first (keeps tower bins
+                # editable); EP re-pack as fallback. A failed re-pack would
+                # silently DROP the item — discard the candidate instead.
+                a_new = _bin_minus_items(a, {ra[0]}, ilookup)
+                if a_new is None:
+                    a_new = Bin3D(a.vtype,a.W,a.D,a.H,a.max_weight,a.max_value,a.gravity,a.cost)
+                    a_ok = True
+                    for r2 in a.items:
+                        if r2[0] != ra[0]:
+                            if not a_new.try_add(ilookup[r2[0]]):
+                                a_ok = False
+                                break
+                    if not a_ok:
+                        continue
                 for rb in rb_pool:
                     if time.monotonic() > t_end:
                         return bins, False
                     if ra[0] == rb[0]:
                         continue
                     ib = ilookup[rb[0]]
-                    b_new = Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
-                    b_ok = True
-                    for r2 in b.items:
-                        if r2[0] != rb[0]:
-                            if not b_new.try_add(ilookup[r2[0]]):
-                                b_ok = False
-                                break
-                    if not b_ok:
-                        continue
+                    b_new = _bin_minus_items(b, {rb[0]}, ilookup)
+                    if b_new is None:
+                        b_new = Bin3D(b.vtype,b.W,b.D,b.H,b.max_weight,b.max_value,b.gravity,b.cost)
+                        b_ok = True
+                        for r2 in b.items:
+                            if r2[0] != rb[0]:
+                                if not b_new.try_add(ilookup[r2[0]]):
+                                    b_ok = False
+                                    break
+                        if not b_ok:
+                            continue
                     # Work on a copy: a successful try_add(ib) followed by a
                     # failed try_add(ia) must not pollute a_new for the next
                     # rb candidate (it would duplicate ib across two bins).
@@ -923,7 +1037,10 @@ def op_ruin_recreate(bins, ilookup, vehicles, rng, t_end, ruin_frac=0.30):
             if (bi, rec[0]) not in removed_set:
                 keep_per_bin[bi].append(ilookup[rec[0]])
 
-    # Reconstruct surviving bins from scratch (re-pack kept items)
+    # Reconstruct surviving bins from scratch (re-pack kept items, which
+    # compacts EP-built bins); when the re-pack fails — typical for tower /
+    # pattern bins whose geometry EP cannot reproduce — fall back to the
+    # geometry-preserving subset rebuild instead of aborting the whole kick.
     surv = []
     for bi, b in enumerate(bins):
         kept = keep_per_bin[bi]
@@ -939,7 +1056,10 @@ def op_ruin_recreate(bins, ilookup, vehicles, rng, t_end, ruin_frac=0.30):
                 ok = False
                 break
         if not ok:
-            return bins, False
+            removed_here = {rec[0] for (_s, bj, rec) in chosen if bj == bi}
+            nb = _bin_minus_items(b, removed_here, ilookup)
+            if nb is None:
+                return bins, False
         surv.append(nb)
 
     removed_items = [ilookup[rec[0]] for _, _, rec in chosen]
@@ -1362,11 +1482,13 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
         ('SPLIT',  lambda c: op_bin_split(c, ilookup, vehicles, rng, t_end)),
         ('REDIS',  lambda c: op_redistribute_then_retype(c, ilookup, vehicles, rng, t_end)),
         ('DRAIN',  lambda c: op_drain_retype(c, ilookup, vehicles, rng, t_end)),
+        ('ELIMR',  lambda c: op_elim_repack(c, ilookup, vehicles, rng, t_end)),
     ]
     decay_factor = {'RELOC': 0.88, 'RETYPE': 0.92, 'RETALL': 0.94, 'SHAKE': 0.92,
                     'MERGE3': 0.90, 'EJECT': 0.95, 'SWAP': 0.93,
                     'CONS2': 0.92, 'RUIN': 0.95, 'RUIN_STRONG': 0.97,
-                    'WPAIR': 0.92, 'SPLIT': 0.93, 'REDIS': 0.94, 'DRAIN': 0.93}
+                    'WPAIR': 0.92, 'SPLIT': 0.93, 'REDIS': 0.94, 'DRAIN': 0.93,
+                    'ELIMR': 0.94}
     n_ops    = len(sec_ops)
     weights  = [1.0] * n_ops
     reaction = 0.40   # how aggressively we update weights on success
@@ -1477,6 +1599,7 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
             lambda x: op_consolidate_pair(x, ilookup, vehicles, rng, t_end),
             lambda x: op_weight_pair_repack(x, ilookup, vehicles, rng, t_end),
             lambda x: op_drain_retype(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_elim_repack(x, ilookup, vehicles, rng, t_end),
             lambda x: op_relocate(x, ilookup, vehicles, rng, t_end),
             lambda x: op_retype_all(x, ilookup, vehicles, t_end),
             lambda x: op_retype(x, ilookup, vehicles, rng, t_end),
@@ -1510,6 +1633,17 @@ def _retype_partial_bin(b, items_in_b, by_abs, t_end):
     Returns new bin (or original if no downsize found)."""
     tw = sum(it['weight'] for it in items_in_b)
     tv = sum(it['value']  for it in items_in_b)
+    # Geometry transplant precondition: if the bin still holds exactly the
+    # items_in_b set, the placed extents tell whether the SAME coordinates
+    # fit a smaller vehicle (gravity/overlap are position-properties and
+    # carry over unchanged). This is the only retype that works on tower /
+    # pattern bins, whose geometry an EP re-pack cannot reproduce.
+    same_set = {rec[0] for rec in b.items} == {it['id'] for it in items_in_b}
+    if same_set and b.items:
+        ext_x = max(rec[1] + rec[4] for rec in b.items)
+        ext_y = max(rec[2] + rec[5] for rec in b.items)
+        ext_z = max(rec[3] + rec[6] for rec in b.items)
+    ilook = {it['id']: it for it in items_in_b}
     for v in by_abs:
         if time.monotonic() > t_end: break
         if v['cost'] >= b.cost - 1e-9: break
@@ -1517,6 +1651,26 @@ def _retype_partial_bin(b, items_in_b, by_abs, t_end):
         if v['max_value']  < tv - 1e-9: continue
         # Heuristic: also need volume to fit at least
         if v['vol'] < sum(it['vol'] for it in items_in_b) - 1e-9: continue
+        if same_set and b.items \
+                and ext_x <= v['W'] - _SAFE + 1e-9 \
+                and ext_y <= v['D'] - _SAFE + 1e-9 \
+                and ext_z <= v['H'] - _SAFE + 1e-9:
+            nb = Bin3D(v['type'], v['W'], v['D'], v['H'],
+                       v['max_weight'], v['max_value'],
+                       v['gravity'], v['cost'])
+            for (iid, x, y, z, iw, id_, ih, rot) in b.items:
+                it = ilook[iid]
+                nb.place(iid, x, y, z, iw, id_, ih, rot,
+                         it['weight'], it['value'])
+            # Support must be re-verified against the NEW vehicle's
+            # gravityStrength (it may be stricter than the old one).
+            grav_ok = True
+            for (iid, x, y, z, iw, id_, ih, rot) in b.items:
+                if z > 1e-9 and not nb._grav_ok(x, y, z, iw, id_, ih):
+                    grav_ok = False
+                    break
+            if grav_ok:
+                return nb
         # Stable baseline: volume-first retype order.
         nb = Bin3D(v['type'], v['W'], v['D'], v['H'],
                    v['max_weight'], v['max_value'],
@@ -1928,7 +2082,7 @@ def construct_layered(items_dicts, vehicles, t_end):
     return bins
 
 
-def _build_tower_bins(plan, primary, by_abs, t_end, opener='deep'):
+def _build_tower_bins(plan, primary, by_abs, t_end, opener='deep', topup=True):
     """
     Shelf-pack tower groups into bins of *primary*.
 
@@ -2018,12 +2172,73 @@ def _build_tower_bins(plan, primary, by_abs, t_end, opener='deep'):
                     # for this shelf position by advancing past its width
                     x += fw + s
                     continue
+                # Mixed-tower top-up: continue the stack with items from OTHER
+                # groups whose footprint fits inside the current top face.
+                # The upper footprint is fully covered by the face below, so
+                # support stays at 100% and ANY gravityStrength is satisfied.
+                # This recovers the height a single-type tower wastes (e.g.
+                # 2×1160 = 2320 in H=2950 → top a 478-high item: 2798).
+                # It is a diversification AXIS (topup on/off): eating small
+                # items as fillers helps some fleets and hurts others, so both
+                # variants run and feed the pool.
+                top_fw, top_fd = fw, fd
+                while topup:
+                    rem_h = H - s - z
+                    best_t = None
+                    for g2 in work:
+                        if not g2['items'] or g2['fh'] > rem_h + 1e-9:
+                            continue
+                        it2 = g2['items'][0]
+                        if not b.cap_ok(it2['weight'], it2['value']):
+                            continue
+                        for (fw2, fd2, rot2) in g2['alts']:
+                            if fw2 <= top_fw + 1e-9 and fd2 <= top_fd + 1e-9:
+                                key = (g2['fh'], fw2 * fd2)
+                                if best_t is None or key > best_t[0]:
+                                    best_t = (key, g2, fw2, fd2, rot2)
+                    if best_t is None:
+                        break
+                    _, g2, fw2, fd2, rot2 = best_t
+                    fh2 = g2['fh']
+                    if b._overlaps(x, y, z, fw2, fd2, fh2):
+                        break
+                    if not b._grav_ok(x, y, z, fw2, fd2, fh2):
+                        break
+                    it2 = g2['items'].pop(0)
+                    b.place(it2['id'], x, y, z, fw2, fd2, fh2, rot2,
+                            it2['weight'], it2['value'])
+                    z += fh2 + s
+                    top_fw, top_fd = fw2, fd2
                 shelf_used = True
                 x += fw + s
             if not shelf_used:
                 break
             y += shelf_d + s
         if b.items:
+            # EP top-up: shelf packing leaves floor strips and corner gaps
+            # that pure towers cannot use. Fill them with ANY remaining items
+            # (vol-desc, bounded failures) via the regular EP engine — every
+            # placement fully checked. Raises per-bin fill beyond the tower
+            # ceiling; on exact-pattern instances try_add simply finds no
+            # space and this is a cheap no-op.
+            if topup:
+                rem_pool = [it for g in work for it in g['items']]
+                rem_pool.sort(key=lambda it: -it['vol'])
+                fails = 0
+                placed_ids = set()
+                for it in rem_pool:
+                    if fails >= 12 or time.monotonic() > t_end:
+                        break
+                    if not b.cap_ok(it['weight'], it['value']):
+                        continue
+                    if b.try_add(it):
+                        placed_ids.add(it['id'])
+                    else:
+                        fails += 1
+                if placed_ids:
+                    for g in work:
+                        g['items'] = [it for it in g['items']
+                                      if it['id'] not in placed_ids]
             bins.append(b)
         else:
             # No tower item placeable in a fresh primary bin (caps too tight
@@ -2159,7 +2374,10 @@ def construct_towers(items_dicts, vehicles, t_end, pool=None):
     candidates = []
     for primary in prims:
         W, D, H = primary['W'], primary['D'], primary['H']
-        prim_patterns = {}
+        # Separate pattern dicts per top-up flag: top-up bins and pure tower
+        # bins have different per-bin compositions, and mixing their
+        # templates in one cover IP materialises incoherent covers.
+        prim_patterns_by = {True: {}, False: {}}
         for policy in (0, 1, 2):
             if time.monotonic() > t_end:
                 break
@@ -2203,15 +2421,17 @@ def construct_towers(items_dicts, vehicles, t_end, pool=None):
                     plan.append({'alts': alts, 'fh': fh, 'items': g})
             if not plan:
                 continue
-            for opener in ('deep', 'shallow'):
+            for opener, do_topup in (('deep', True), ('deep', False),
+                                     ('shallow', True), ('shallow', False)):
                 if time.monotonic() > t_end:
                     break
                 bins = _build_tower_bins(plan, primary, by_abs, t_end,
-                                         opener=opener)
+                                         opener=opener, topup=do_topup)
                 if bins is None:
                     continue
                 # Mine per-bin patterns (group-count vectors + placement
                 # templates) BEFORE squeeze/retype — pure tower bins only.
+                prim_patterns = prim_patterns_by[do_topup]
                 if mine_patterns and len(prim_patterns) < 400:
                     for b in bins:
                         if b.vtype != primary['type']:
@@ -2260,7 +2480,10 @@ def construct_towers(items_dicts, vehicles, t_end, pool=None):
         # the items, so their bins can't be mixed by the set-partition MILP
         # (overlapping item sets). The pattern-level cover IP CAN mix them —
         # e.g. mono-type bins from one policy with mixed bins from another.
-        if mine_patterns and prim_patterns and time.monotonic() < t_end:
+        for prim_patterns in prim_patterns_by.values():
+            if not (mine_patterns and prim_patterns
+                    and time.monotonic() < t_end):
+                continue
             try:
                 pc = _pattern_cover_bins(prim_patterns, glist, primary, t_end)
             except Exception:
@@ -2983,9 +3206,16 @@ def _solve_cover_highspy(
             h.addConstr(expr <= 0)
 
         if warm_cols:
-            idx = np.asarray(sorted(set(int(c) for c in warm_cols)), dtype=np.int32)
-            vals = np.ones(len(idx), dtype=np.float64)
-            h.setSolution(len(idx), idx, vals)
+            # Dense, COMPLETE MIP start: a partial (sparse) solution leaves
+            # HiGHS to complete the unset binaries and it often silently
+            # drops the start — observed as MILP results far above a
+            # feasible incumbent. With the full 0/1 vector the start is
+            # accepted as-is and HiGHS can only improve on it.
+            full = np.zeros(len(scaled_costs), dtype=np.float64)
+            for c in warm_cols:
+                full[int(c)] = 1.0
+            h.setSolution(len(full),
+                          np.arange(len(full), dtype=np.int32), full)
 
         h.solve()
         model_status = h.getModelStatus()
@@ -2999,7 +3229,16 @@ def _solve_cover_highspy(
         if model_status not in good:
             return None
 
-        vals = np.asarray(h.allVariableValues(), dtype=np.float64)
+        # Read the incumbent via getSolution() (the canonical best-found MIP
+        # solution); allVariableValues() as fallback.
+        vals = None
+        try:
+            sol = h.getSolution()
+            vals = np.asarray(sol.col_value, dtype=np.float64)
+        except Exception:
+            vals = None
+        if vals is None or vals.size != len(scaled_costs):
+            vals = np.asarray(h.allVariableValues(), dtype=np.float64)
         if vals.size != len(scaled_costs):
             return None
         return vals
@@ -3114,6 +3353,30 @@ def _rebuild_bin_subset(template_bin, records, ilookup):
     return nb
 
 def _pack_assigned_items(template_bin, assigned_ids, ilookup):
+    ids = set(assigned_ids)
+    orig_ids = {rec[0] for rec in template_bin.items}
+    # Full bin kept → reuse the EXACT discovered geometry. Columns built by
+    # direct placement (towers, pattern cover) are often NOT reproducible by
+    # the EP try_add heuristic; the old unconditional re-pack spilled their
+    # items into extra bins and deterministically inflated every MILP
+    # solution that selected such columns (e.g. a 25-bin cover ballooned to
+    # 35 bins in post-processing).
+    if ids == orig_ids:
+        return template_bin.copy(), []
+    # Subset kept → keep the original coordinates, drop removed boxes, and
+    # verify the remaining stacks are still supported (removing a box can
+    # only break gravity above it — bounds/overlap/caps are monotone).
+    keep_recs = [rec for rec in template_bin.items if rec[0] in ids]
+    if keep_recs:
+        nb = _rebuild_bin_subset(template_bin, keep_recs, ilookup)
+        ok = True
+        for (iid, x, y, z, iw, id_, ih, orient) in keep_recs:
+            if z > 1e-9 and not nb._grav_ok(x, y, z, iw, id_, ih):
+                ok = False
+                break
+        if ok:
+            return nb, []
+    # Fallback: EP re-pack (original behaviour).
     rec_map = {rec[0]: rec for rec in template_bin.items}
     ordered = sorted(
         assigned_ids,
@@ -3508,16 +3771,28 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
     try:
         max_c = max(float(np.max(costs)), 1.0)
         scaled_costs = costs / max_c
-        warm_cols = set(_build_cover_warm_start(A, costs))
+        # MIP start: the incumbent ALONE when all of its columns are present
+        # (a complete, best-known cover — HiGHS then can only improve on it).
+        # Unioning it with the greedy item-wise cover (old behaviour) bloats
+        # the start with hundreds of overlapping columns and HiGHS may spend
+        # the whole budget below the incumbent's quality.
+        warm_cols = None
         if warm_keys:
             key_to_idx = {
                 frozenset(rec[0] for rec in b.items): j
                 for j, b in enumerate(columns)
             }
+            inc_idx = set()
             for k in warm_keys:
                 j = key_to_idx.get(k)
-                if j is not None:
-                    warm_cols.add(j)
+                if j is None:
+                    inc_idx = None
+                    break
+                inc_idx.add(j)
+            if inc_idx:
+                warm_cols = inc_idx
+        if warm_cols is None:
+            warm_cols = set(_build_cover_warm_start(A, costs))
 
         cover_rows = [A.getrow(i).indices.tolist() for i in range(n_items)]
         candidate_x = []
@@ -3551,6 +3826,16 @@ def solve_set_partition(columns, all_item_ids, t_budget=45.0, max_cols=900,
 
         if x_main is not None:
             candidate_x.append(x_main)
+
+        # Safety net: the warm cover itself is always a candidate. Immune to
+        # any solver quirk that drops the MIP start — the returned 'MILP
+        # solution' can then never be worse than the incumbent it started
+        # from, so a wasted MILP run can no longer pollute the log/flow.
+        if warm_cols:
+            x_warm = np.zeros(len(scaled_costs), dtype=np.float64)
+            for j in warm_cols:
+                x_warm[int(j)] = 1.0
+            candidate_x.append(x_warm)
 
         if use_cpsat and cpsat_budget > 1.0:
             x_cp = _solve_cover_cpsat(
@@ -4320,6 +4605,23 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                     return True
             return False
 
+        def cols_with_incumbent(cols_list):
+            """Guarantee the incumbent's own columns are in the MILP input.
+            Pool eviction under saturation can drop them, which once made the
+            set-partition INFEASIBLE (no full cover among filtered columns);
+            with the incumbent always present the MILP can never do worse
+            than the current best, and feasibility is structural."""
+            with lock:
+                inc = [b.copy() for b in (best_bins[0] or [])]
+            seen_k = {frozenset(r[0] for r in b.items) for b in cols_list}
+            extra = []
+            for b in inc:
+                k = frozenset(r[0] for r in b.items)
+                if k not in seen_k:
+                    seen_k.add(k)
+                    extra.append(b)
+            return cols_list + extra
+
         # ─────────────────────────────────────────────────────────────────────
         # PHASE 1 — Parallel construction
         # ─────────────────────────────────────────────────────────────────────
@@ -4465,12 +4767,20 @@ class solver_364130_354977_356856_359530(AbstractSolver):
         restarts  = [0]
 
         def _deep_lns():
-            with lock:
-                snap = [b.copy() for b in best_bins[0]]
-            rng = random.Random(seed0 + 42)
-            improved = lns(snap, ilookup, vehicles, t_p2, rng,
-                           verbose=self.VERBOSE, pool=pool)
-            update_best(improved, 'lns-deep')
+            # lns() returns early on stagnation (stag >= 150); a single call
+            # used to waste the rest of Phase 2 once it gave up. Re-attack
+            # the current best with a FRESH random stream until the phase
+            # budget is spent — different operator orderings reach different
+            # neighbourhoods of the same incumbent.
+            i = 0
+            while time.monotonic() < t_p2 - 1.0:
+                with lock:
+                    snap = [b.copy() for b in best_bins[0]]
+                rng = random.Random(seed0 + 42 + i * 7919)
+                improved = lns(snap, ilookup, vehicles, t_p2, rng,
+                               verbose=self.VERBOSE and i == 0, pool=pool)
+                update_best(improved, f'lns-deep-{i}')
+                i += 1
 
         def _restart_worker(seed_base):
             rng = random.Random(seed_base)
@@ -4492,7 +4802,13 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                         restarts[0] += 1
                     if unp:
                         continue
-                    pool.add_solution(bins)
+                    # Harvest-gate: only near-best covers feed the pool. An
+                    # unbounded stream of mediocre restarts saturates the pool
+                    # and eviction then squeezes out the useful columns.
+                    with lock:
+                        pool_gate = best_cost[0] * 1.25
+                    if _cost(bins) <= pool_gate:
+                        pool.add_solution(bins)
                     with lock:
                         thresh = best_cost[0] * 1.10
                     if _cost(bins) <= thresh:
@@ -4501,7 +4817,25 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                     update_best(bins, 'restart')
                 return
 
+            # Diversification with a futility switch: on instances where the
+            # incumbent comes from a constructor basin GRASP cannot reach
+            # (e.g. tower covers), hundreds of restarts produce nothing while
+            # burning 3 of the 4 threads. After 40 consecutive restarts with
+            # no global improvement, this worker converts itself into an
+            # extra parallel deep-LNS attacker on the shared incumbent.
+            futile = 0
             while time.monotonic() < t_p2:
+                if futile >= 40:
+                    while time.monotonic() < t_p2:
+                        with lock:
+                            snap = [b.copy() for b in best_bins[0]]
+                        vehs = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
+                        burst_end = min(time.monotonic() + 30.0, t_p2)
+                        cand = lns(snap, ilookup, vehs, burst_end, rng,
+                                   verbose=False, pool=pool)
+                        if update_best(cand, 'lns-par'):
+                            futile = 0
+                    return
                 alpha = rng.uniform(0.05, 0.35)
                 bf    = rng.random() < 0.5
                 vehs  = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
@@ -4511,14 +4845,22 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                 with lock:
                     restarts[0] += 1
                 if unp:
+                    futile += 1
                     continue
-                pool.add_solution(bins)
+                # Harvest-gate (see deterministic branch).
+                with lock:
+                    pool_gate = best_cost[0] * 1.25
+                if _cost(bins) <= pool_gate:
+                    pool.add_solution(bins)
                 with lock:
                     thresh = best_cost[0] * 1.10
                 if _cost(bins) <= thresh:
                     tl   = min(time.monotonic() + 35.0, t_p2)
                     bins = lns(bins, ilookup, vehs, tl, rng, verbose=False, pool=pool)
-                update_best(bins, 'restart')
+                if update_best(bins, 'restart'):
+                    futile = 0
+                else:
+                    futile += 1
 
         with ThreadPoolExecutor(max_workers=self.N_THREADS) as ex:
             futures = [ex.submit(_deep_lns)]
@@ -4671,7 +5013,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
             if ct_cols:
                 log(f"  Cost-targeted CG: {len(ct_cols)} cheaper-replacement columns")
 
-        cols = pool.get_columns()
+        cols = cols_with_incumbent(pool.get_columns())
         log(f"  Column pool size: {len(cols)}")
 
         milp_budget = min(34.0 * cg_mult, tend - time.monotonic() - 24.0)
@@ -4726,7 +5068,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
             mine_columns_from_incumbent(
                 incumbent, ilookup, vehicle_cycle, pool, t_mine, random.Random(seed0 + 7777)
             )
-            cols2 = pool.get_columns()
+            cols2 = cols_with_incumbent(pool.get_columns())
             log(f"  Column pool after intensification: {len(cols2)}")
             # MILP-2 gets pool + shadow CG cols; commit decision below.
             cols2_for_milp = cols2 + cg_shadow_cols if cg_shadow_cols else cols2
@@ -4898,7 +5240,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
 
         rem = tend - time.monotonic()
         if rem > 2.5:
-            cols3 = pool.get_columns()
+            cols3 = cols_with_incumbent(pool.get_columns())
             if cols3:
                 # Budget shaved 1s vs original (was rem-0.8) so there is a
                 # meaningful tail window for the post-MILP polish below.
