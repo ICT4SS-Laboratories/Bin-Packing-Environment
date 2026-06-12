@@ -53,7 +53,16 @@ if __name__ == '__main__':
                 (d, h, w), (w, h, d), (h, w, d)][o]
 
     def cost_if_feasible(ds):
-        """Objective cost of the on-disk CSV if feasible (exact checker), else None."""
+        """Objective cost of the on-disk CSV if feasible (exact checker), else
+        None. Never raises: a transient FS error here (observed: TimeoutError
+        from read_csv under system load) must not kill the whole batch."""
+        try:
+            return _cost_if_feasible_inner(ds)
+        except Exception as e:
+            print(f"  (comparison skipped: {type(e).__name__}: {e})")
+            return None
+
+    def _cost_if_feasible_inner(ds):
         inst = Instance(ds)
         items, veh = inst.df_items, inst.df_vehicles
         idict, vdict = items.to_dict('index'), veh.to_dict('index')
@@ -64,16 +73,30 @@ if __name__ == '__main__':
             sol = pd.read_csv(path)
         except Exception:
             return None
+        # New official-checker format rules (June 2026 version).
+        vidxs = sorted(sol['idx_vehicle'].dropna().unique())
+        if vidxs != list(range(len(vidxs))):
+            return None
         total = 0.0
         placed = set()
         for vidx, g in sol.groupby('idx_vehicle'):
+            if g['type_vehicle'].nunique(dropna=False) != 1:
+                return None
             v = vdict[g.iloc[0]['type_vehicle']]
             total += v['cost']
             boxes = []; tw = tval = 0.0
             for _, r in g.iterrows():
-                placed.add(r['id_item']); it = idict[r['id_item']]
-                w, d, h = get_dims(it, int(r['orient']))
+                iid = r['id_item']
+                if iid in placed:
+                    return None
+                placed.add(iid); it = idict[iid]
+                o = int(r['orient'])
+                if o < 0 or o > 5 or str(o) not in str(it['allowedRotations']):
+                    return None
+                w, d, h = get_dims(it, o)
                 x, y, z = r['x_origin'], r['y_origin'], r['z_origin']
+                if x < 0 or y < 0 or z < 0:
+                    return None
                 b = (x, y, z, x + d, y + w, z + h, w * d)
                 if b[3] > v['depth'] or b[4] > v['width'] or b[5] > v['height']:
                     return None

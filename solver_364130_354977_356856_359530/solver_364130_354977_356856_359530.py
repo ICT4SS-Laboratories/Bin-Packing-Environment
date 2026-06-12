@@ -678,6 +678,10 @@ def _validate_solution_exact(bins, ilookup):
             it = ilookup.get(iid)
             if it is None:
                 return f'unknown item {iid}'
+            # New checker rule: orientation must be among allowedRotations.
+            # urots only contains allowed codes, so any mismatch is corruption.
+            if not any(r == rot for (r, *_d) in it['urots']):
+                return f'forbidden rotation {iid} o={rot}'
             tw += it['weight']
             tv += it['value']
             if (x < -1e-9 or y < -1e-9 or z < -1e-9
@@ -1519,12 +1523,19 @@ def op_retype_all(bins, ilookup, vehicles, t_end):
         return cur, True
     return bins, False
 
-def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
+def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None,
+        global_best=None):
     """
     Adaptive Large Neighborhood Search (ALNS).
     op_elim is always tried first (deterministic improvement, cheap).
     The remaining operators are selected by roulette wheel based on recent success.
     Weights are periodically decayed toward uniform to keep exploration alive.
+
+    global_best: optional callable returning the swarm's current best cost.
+    When another worker is ≥8% ahead of what this call is grinding, the call
+    aborts so its caller can re-snapshot from the better incumbent — observed
+    on DatasetO: the deep worker spent minutes ELIMing an 89k cover one bin
+    at a time while a restart had already found 52k.
     """
     if rng is None: rng=random.Random()
     cur=list(bins); stag=0
@@ -1594,6 +1605,9 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None):
     best_cur = [b.copy() for b in cur]
 
     while time.monotonic() < t_end:
+        if global_best is not None and \
+                global_best() < best_cost_seen * 0.92 - 1e-9:
+            break   # the swarm is far ahead — re-snapshot from there
         # Always try elim first.
         new, ok = op_elim(cur, ilookup, vehicles, t_end)
         if ok and not _move_ok(new, 'ELIM'):
@@ -2749,6 +2763,128 @@ def construct_knapsack_packed(items_dicts, vehicles, t_end):
         items_in_b = [item_by_id[rec[0]] for rec in bins[i].items]
         bins[i] = _retype_partial_bin(bins[i], items_in_b, by_abs, t_end)
     return bins
+
+
+def construct_dominant_1d(items_dicts, vehicles, t_end, pool=None):
+    """
+    Group-first constructor for instances dominated by ONE additive resource.
+
+    When the binding resource (weight or value) pressure on the cheapest
+    per-unit vehicle dwarfs the volume pressure, optimal covers are
+    essentially 1-D bin packings of that resource. Incremental EP packing
+    cannot reproduce them — a geometric failure mid-stream spills the item
+    into a new bin — but GROUP-FIRST can: compute First-Fit-Decreasing
+    groups on the resource (classic 11/9-OPT heuristic, with the second cap
+    tracked too), then materialise each group from scratch with the
+    multi-ordering exact packer. Groups that still don't fit geometrically
+    shed their lightest item to a leftover pool, re-packed at the end.
+    Purely instance-driven; on volume-bound fleets the gate never fires.
+    """
+    if not items_dicts or not vehicles:
+        return None
+    res, _tot = _active_resources(items_dicts, vehicles)
+    res = [r for r in res if r in ('weight', 'value')]
+    if not res:
+        return None
+    by_abs = sorted(vehicles, key=lambda v: v['cost'])
+    cands = []
+    seen = set()
+    for r in res:
+        key = (lambda v: v['max_weight']) if r == 'weight' \
+            else (lambda v: v['max_value'])
+        vs = [v for v in vehicles if 0.0 < key(v) < 1e17]
+        vs.sort(key=lambda v: v['cost'] / key(v))
+        if vs and vs[0]['type'] not in seen:
+            seen.add(vs[0]['type'])
+            cands.append((r, vs[0]))
+
+    item_by_id = {it['id']: it for it in items_dicts}
+    best_out = None
+    for r, v in cands:
+        if time.monotonic() > t_end:
+            break
+        cap = v['max_weight'] if r == 'weight' else v['max_value']
+        dem = (lambda it: it['weight']) if r == 'weight' \
+            else (lambda it: it['value'])
+        other = (lambda it: it['value']) if r == 'weight' \
+            else (lambda it: it['weight'])
+        ocap = v['max_value'] if r == 'weight' else v['max_weight']
+        ok_items = [it for it in items_dicts if _vehicle_accepts_item(it, v)]
+        rest = [it for it in items_dicts if not _vehicle_accepts_item(it, v)]
+        if not ok_items:
+            continue
+        # Dominance gate: the resource must bind much harder than geometry.
+        press_r = sum(dem(it) for it in ok_items) / max(cap, 1e-9)
+        press_v = sum(it['vol'] for it in ok_items) / max(v['vol'], 1e-9)
+        if press_r < 1.5 * press_v:
+            continue
+        # Group-size gate: group-first only pays off for SMALL groups (the
+        # from-scratch exact packer is cheap and reliable there); with tens
+        # of items per bin the incremental EP path is both faster and better.
+        avg_group = len(ok_items) / max(press_r, 1.0)
+        if avg_group > 12.0:
+            continue
+
+        # 1-D FFD groups on the dominant resource (secondary cap tracked).
+        groups, loads, oloads = [], [], []
+        for it in sorted(ok_items, key=lambda x: -dem(x)):
+            placed = False
+            for gi in range(len(groups)):
+                if loads[gi] + dem(it) <= cap + 1e-9 and \
+                        (ocap >= 1e17 or oloads[gi] + other(it) <= ocap + 1e-9):
+                    groups[gi].append(it)
+                    loads[gi] += dem(it)
+                    oloads[gi] += other(it)
+                    placed = True
+                    break
+            if not placed:
+                groups.append([it])
+                loads.append(dem(it))
+                oloads.append(other(it))
+
+        # Materialise each group from scratch; shed lightest on failure.
+        rng = random.Random(20240613)
+        bins = []
+        leftovers = list(rest)
+        feas = True
+        for grp in groups:
+            if time.monotonic() > t_end:
+                feas = False
+                break
+            g = sorted(grp, key=lambda x: -dem(x))
+            while g:
+                nb = _pack_exact(g, v, t_end, rng)
+                if nb is not None:
+                    bins.append(nb)
+                    break
+                leftovers.append(g.pop())
+        if not feas:
+            continue
+        still = []
+        for it in sorted(leftovers, key=lambda x: -x['vol']):
+            placed = False
+            for b in bins:
+                if b.try_add(it):
+                    placed = True
+                    break
+            if not placed:
+                still.append(it)
+        if still:
+            tail, unp = pack(sorted(still, key=lambda x: -x['vol']),
+                             by_abs, t_end=t_end)
+            if unp:
+                continue
+            bins.extend(tail)
+        for i in range(len(bins)):
+            if time.monotonic() > t_end:
+                break
+            items_in_b = [item_by_id[rec[0]] for rec in bins[i].items]
+            bins[i] = _retype_partial_bin(bins[i], items_in_b, by_abs, t_end)
+        if pool is not None:
+            pool.add_solution(bins)
+        if best_out is None or _cost(bins) < _cost(best_out):
+            best_out = bins
+    return best_out
 
 
 def construct_weight_packed_diverse(items_dicts, vehicles, t_end, rng,
@@ -4787,6 +4923,8 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                 bins = construct_towers(items, vehicles, t_p1, pool=pool)
             elif mode == 'knap':
                 bins = construct_knapsack_packed(items, vehicles, t_p1)
+            elif mode == 'dom1d':
+                bins = construct_dominant_1d(items, vehicles, t_p1, pool=pool)
             else:
                 return label, None, float('inf')
             if bins is None:
@@ -4828,6 +4966,7 @@ class solver_364130_354977_356856_359530(AbstractSolver):
             ('lay-pack', 'layered', seed0 + 53),
             ('twr-pack', 'towers',  seed0 + 54),
             ('knap-pack', 'knap',   seed0 + 55),
+            ('1d-pack',  'dom1d',   seed0 + 56),
         ]
 
         with ThreadPoolExecutor(max_workers=self.N_THREADS) as ex:
@@ -4878,7 +5017,12 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                 rf.append(f)
             avg_r = sum(rf) / len(rf)
             avg_v = sum(vf) / len(vf)
-            resource_bound = avg_r > 0.60 and avg_r > 1.5 * avg_v
+            # Small incumbents are excluded: with few bins the set-partition
+            # reproduces the incumbent in seconds (observed on every run of
+            # such instances) while the parallel-LNS attackers are what
+            # actually close them — keep the longer Phase 2 there.
+            resource_bound = (avg_r > 0.60 and avg_r > 1.5 * avg_v
+                              and len(best_bins[0]) >= 40)
         cg_mult = 2.0 if resource_bound else 1.0
         if resource_bound:
             log("  Instance profile: RESOURCE-bound → extended CG/MILP budget")
@@ -4902,7 +5046,8 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                     snap = [b.copy() for b in best_bins[0]]
                 rng = random.Random(seed0 + 42 + i * 7919)
                 improved = lns(snap, ilookup, vehicles, t_p2, rng,
-                               verbose=self.VERBOSE and i == 0, pool=pool)
+                               verbose=self.VERBOSE and i == 0, pool=pool,
+                               global_best=lambda: best_cost[0])
                 update_best(improved, f'lns-deep-{i}')
                 i += 1
 
@@ -4956,7 +5101,8 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                         vehs = vehicle_cycle[rng.randrange(len(vehicle_cycle))]
                         burst_end = min(time.monotonic() + 30.0, t_p2)
                         cand = lns(snap, ilookup, vehs, burst_end, rng,
-                                   verbose=False, pool=pool)
+                                   verbose=False, pool=pool,
+                                   global_best=lambda: best_cost[0])
                         if update_best(cand, 'lns-par'):
                             futile = 0
                     return
@@ -4980,7 +5126,8 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                     thresh = best_cost[0] * 1.10
                 if _cost(bins) <= thresh:
                     tl   = min(time.monotonic() + 35.0, t_p2)
-                    bins = lns(bins, ilookup, vehs, tl, rng, verbose=False, pool=pool)
+                    bins = lns(bins, ilookup, vehs, tl, rng, verbose=False,
+                               pool=pool, global_best=lambda: best_cost[0])
                 if update_best(bins, 'restart'):
                     futile = 0
                 else:
@@ -5045,6 +5192,15 @@ class solver_364130_354977_356856_359530(AbstractSolver):
                         f"cost={_cost(kb):.2f}")
             except Exception as e:
                 log(f"  knapsack-packed seed failed: {e}")
+            try:
+                db = construct_dominant_1d(items, vehicles, t_seed_end,
+                                           pool=pool)
+                if db:
+                    pool.add_solution(db)
+                    log(f"  Pre-seed dominant-1d: {len(db)} bins, "
+                        f"cost={_cost(db):.2f}")
+            except Exception as e:
+                log(f"  dominant-1d seed failed: {e}")
             try:
                 tb = construct_towers(items, vehicles, t_seed_end, pool=pool)
                 if tb:

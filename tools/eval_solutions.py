@@ -92,18 +92,46 @@ def check(ds):
     feasible = True
     placed = set()
     reasons = []
+    # ── New official-checker format rules (June 2026 version) ──
+    req = {"type_vehicle", "idx_vehicle", "id_item",
+           "x_origin", "y_origin", "z_origin", "orient"}
+    if req - set(sol.columns):
+        reasons.append("MISSING COLUMNS"); feasible = False
+    vidxs = sorted(sol["idx_vehicle"].dropna().unique())
+    if vidxs != list(range(len(vidxs))):
+        reasons.append("NON-CONSECUTIVE IDX"); feasible = False
     for vidx, g in sol.groupby("idx_vehicle"):
         vt = g.iloc[0]['type_vehicle']
+        if g["type_vehicle"].nunique(dropna=False) != 1:
+            reasons.append(f"MIXED TYPES v{vidx}"); feasible = False
+            continue
+        if vt not in vdict:
+            reasons.append(f"UNKNOWN VEHICLE v{vidx}"); feasible = False
+            continue
         v = vdict[vt]
         total_cost += v["cost"]
         boxes = []; tw = 0.0; tval = 0.0; okv = True
         for _, row in g.iterrows():
-            iid = row["id_item"]; placed.add(iid); it = idict[iid]
-            w, d, h = get_dims(it, int(row["orient"]))
+            iid = row["id_item"]
+            if iid in placed:
+                reasons.append(f"DUPLICATE {iid}"); okv = False
+            placed.add(iid)
+            if iid not in idict:
+                reasons.append(f"UNKNOWN ITEM {iid}"); okv = False
+                continue
+            it = idict[iid]
+            orient = int(row["orient"])
+            if orient < 0 or orient > 5:
+                reasons.append(f"INVALID ORIENT {iid}"); okv = False
+                continue
+            if str(orient) not in str(it["allowedRotations"]):
+                reasons.append(f"FORBIDDEN ROT {iid} o={orient}"); okv = False
+            w, d, h = get_dims(it, orient)
             x, y, z = row["x_origin"], row["y_origin"], row["z_origin"]
             box = {"id": iid, "x1": x, "y1": y, "z1": z,
                    "x2": x + d, "y2": y + w, "z2": z + h, "ba": w * d}
-            if box["x2"] > v["depth"] or box["y2"] > v["width"] or box["z2"] > v["height"]:
+            if box["x1"] < 0 or box["y1"] < 0 or box["z1"] < 0 or \
+                    box["x2"] > v["depth"] or box["y2"] > v["width"] or box["z2"] > v["height"]:
                 reasons.append(f"OOB v{vidx} {iid}"); okv = False
             for o in boxes:
                 if boxes_overlap(box, o):
