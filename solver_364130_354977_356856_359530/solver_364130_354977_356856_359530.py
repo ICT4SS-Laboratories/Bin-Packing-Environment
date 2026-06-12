@@ -1586,12 +1586,13 @@ def lns(bins, ilookup, vehicles, t_end, rng=None, verbose=False, pool=None,
         ('REDIS',  lambda c: op_redistribute_then_retype(c, ilookup, vehicles, rng, t_end)),
         ('DRAIN',  lambda c: op_drain_retype(c, ilookup, vehicles, rng, t_end)),
         ('ELIMR',  lambda c: op_elim_repack(c, ilookup, vehicles, rng, t_end)),
+        ('CREBUILD', lambda c: op_constructor_rebuild(c, ilookup, vehicles, rng, t_end)),
     ]
     decay_factor = {'RELOC': 0.88, 'RETYPE': 0.92, 'RETALL': 0.94, 'SHAKE': 0.92,
                     'MERGE3': 0.90, 'EJECT': 0.95, 'SWAP': 0.93,
                     'CONS2': 0.92, 'RUIN': 0.95, 'RUIN_STRONG': 0.97,
                     'WPAIR': 0.92, 'SPLIT': 0.93, 'REDIS': 0.94, 'DRAIN': 0.93,
-                    'ELIMR': 0.94}
+                    'ELIMR': 0.94, 'CREBUILD': 0.94}
     n_ops    = len(sec_ops)
     weights  = [1.0] * n_ops
     reaction = 0.40   # how aggressively we update weights on success
@@ -1714,6 +1715,7 @@ def post_optimize_bins(bins, ilookup, vehicles, t_end, pool=None):
             lambda x: op_weight_pair_repack(x, ilookup, vehicles, rng, t_end),
             lambda x: op_drain_retype(x, ilookup, vehicles, rng, t_end),
             lambda x: op_elim_repack(x, ilookup, vehicles, rng, t_end),
+            lambda x: op_constructor_rebuild(x, ilookup, vehicles, rng, t_end),
             lambda x: op_relocate(x, ilookup, vehicles, rng, t_end),
             lambda x: op_retype_all(x, ilookup, vehicles, t_end),
             lambda x: op_retype(x, ilookup, vehicles, rng, t_end),
@@ -3044,6 +3046,52 @@ def op_redistribute_then_retype(bins, ilookup, vehicles, rng, t_end):
             if _cost(cand) < _cost(bins) - 1e-9:
                 return cand, True
     return bins, False
+
+
+def op_constructor_rebuild(bins, ilookup, vehicles, rng, t_end):
+    """
+    Constructor-based partial rebuild. Pools the items of a few low-fill bins
+    and rebuilds them with the HEAVY constructors (towers / vector / knapsack)
+    instead of the EP-incremental repair every other operator uses.
+
+    On volume-bound instances the bin count is decided by construction
+    STRUCTURE, not by item relocation — moving items between 87%-full bins
+    can never save one, but re-building five of them as tower/pattern bins
+    can yield four. This is the local move that lets an incumbent absorb
+    constructor structure piece by piece. All placements go through the
+    constructors' verified paths; strict-improvement only.
+    """
+    n = len(bins)
+    if n < 4:
+        return bins, False
+    j = min(rng.choice((3, 4, 5, 6)), n - 1)
+    if rng.random() < 0.5:
+        order = sorted(range(n), key=lambda i: _bin_binding_fill(bins[i]))
+        chosen = order[:j]
+    else:
+        chosen = rng.sample(range(n), j)
+    chosen_set = set(chosen)
+    items_sub = [ilookup[rec[0]] for i in chosen for rec in bins[i].items]
+    if len(items_sub) < 2:
+        return bins, False
+    old_cost = sum(bins[i].cost for i in chosen)
+
+    best_sub = None
+    deadline = min(t_end, time.monotonic() + 8.0)
+    for builder in (construct_towers, construct_vector_packed,
+                    construct_knapsack_packed):
+        if time.monotonic() > deadline:
+            break
+        try:
+            cand = builder(items_sub, vehicles, deadline)
+        except Exception:
+            cand = None
+        if cand and (best_sub is None or _cost(cand) < _cost(best_sub)):
+            best_sub = cand
+    if best_sub is None or _cost(best_sub) >= old_cost - 1e-9:
+        return bins, False
+    keep = [bins[i].copy() for i in range(n) if i not in chosen_set]
+    return keep + best_sub, True
 
 
 def _bin_binding_fill(b):
