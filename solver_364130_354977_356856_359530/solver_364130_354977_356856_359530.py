@@ -3064,7 +3064,7 @@ def op_constructor_rebuild(bins, ilookup, vehicles, rng, t_end):
     n = len(bins)
     if n < 4:
         return bins, False
-    j = min(rng.choice((3, 4, 5, 6)), n - 1)
+    j = min(rng.choice((3, 4, 5, 6, 8)), n - 1)
     if rng.random() < 0.5:
         order = sorted(range(n), key=lambda i: _bin_binding_fill(bins[i]))
         chosen = order[:j]
