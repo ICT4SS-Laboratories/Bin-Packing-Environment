@@ -1,3 +1,6 @@
+This is a repository for a project of the course "Operational research" in which we had to manage a bin packing problem in 3d space, using the algorithms that we studied in the lectures.
+
+
 # Problem Description
 
 We have a set of heterogeneous containers, each of which is characterized by:
